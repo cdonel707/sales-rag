@@ -31,6 +31,9 @@ def main():
         'OPENAI_API_KEY'
     ]
     
+    # Check for optional but recommended user token
+    user_token_available = getattr(config, 'SLACK_USER_TOKEN', None)
+    
     missing_vars = []
     for var in required_vars:
         if not getattr(config, var, None):
@@ -44,6 +47,18 @@ def main():
         return
     
     print("✅ Configuration looks good!")
+    
+    # Show token configuration status
+    if user_token_available:
+        print("🔑 Dual-token setup detected:")
+        print("   - SLACK_BOT_TOKEN: For bot interactions")
+        print("   - SLACK_USER_TOKEN: For data syncing (no channel joining needed!)")
+    else:
+        print("⚠️  Single-token setup:")
+        print("   - SLACK_BOT_TOKEN: For both interactions and syncing")
+        print("   - Consider adding SLACK_USER_TOKEN for better data access")
+        print("   - See README for user token setup instructions")
+    
     print("🔄 Starting application...")
     
     # Start the server

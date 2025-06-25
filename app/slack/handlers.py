@@ -5,12 +5,12 @@ import logging
 from typing import Dict, Any, Optional
 import json
 from datetime import datetime
+import os
 
 from ..rag.embeddings import EmbeddingService
 from ..rag.generation import GenerationService
 from ..salesforce.client import SalesforceClient
 from ..database.models import Conversation, SlackDocument
-from ..config import config
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +26,17 @@ class SlackHandler:
         self.salesforce_client = salesforce_client
         self.db_session_maker = db_session_maker
         
+        # Real-time indexing control
+        self.realtime_indexing_enabled = False
+        
         # Initialize Slack app
         self.app = App(
-            token=config.SLACK_BOT_TOKEN,
-            signing_secret=config.SLACK_SIGNING_SECRET
+            token=os.getenv("SLACK_BOT_TOKEN"),
+            signing_secret=os.getenv("SLACK_SIGNING_SECRET"),
+            process_before_response=True
         )
+        self.client = self.app.client
         
-        self.client = WebClient(token=config.SLACK_BOT_TOKEN)
-        
-        # Register handlers
         self._register_handlers()
     
     def _register_handlers(self):
@@ -49,6 +51,13 @@ class SlackHandler:
                 question = command.get('text', '').strip()
                 channel_id = command.get('channel_id')
                 user_id = command.get('user_id')
+                
+                # Ensure bot is in channel for interaction (if it's a channel, not DM)
+                if channel_id and not channel_id.startswith('D'):  # Not a DM
+                    channel_info = self.client.conversations_info(channel=channel_id)
+                    if channel_info.get('ok'):
+                        channel_name = channel_info['channel']['name']
+                        self._ensure_bot_in_channel_for_interaction(channel_id, channel_name)
                 
                 # Start or continue session
                 session_key = f"{channel_id}:{user_id}"
@@ -146,11 +155,21 @@ class SlackHandler:
         def handle_message_events(event, logger):
             """Handle message events for indexing"""
             try:
-                # Index Slack messages for RAG (non-bot messages only)
-                if not event.get('bot_id') and event.get('text'):
-                    self._index_slack_message(event)
+                # Real-time indexing if enabled
+                if self.realtime_indexing_enabled:
+                    if not event.get('bot_id') and event.get('text') and len(event.get('text', '')) >= 10:
+                        logger.info(f"🔄 Real-time indexing message from #{event.get('channel', 'unknown')}")
+                        indexed = self._index_slack_message_realtime(event)
+                        if indexed:
+                            logger.info(f"✅ Real-time indexed message: {event.get('text', '')[:50]}...")
+                        else:
+                            logger.debug(f"⏭️ Skipped indexing message (no relevant entities)")
+                else:
+                    # Legacy behavior - basic indexing for RAG during manual sync
+                    if not event.get('bot_id') and event.get('text'):
+                        self._index_slack_message(event)
             except Exception as e:
-                logger.error(f"Error indexing message: {e}")
+                logger.error(f"Error in message event handler: {e}")
         
         # Button interaction handlers
         @self.app.action("search_records")
@@ -172,12 +191,45 @@ class SlackHandler:
         def handle_end_session(ack, body, respond):
             ack()
             session_key = body['actions'][0]['value']
+            
+            # Clear active session
             if session_key in active_sessions:
                 del active_sessions[session_key]
+            
+            # Clear conversation history from database
+            try:
+                channel_id, user_id = session_key.split(':')
+                self._clear_conversation_history(channel_id, user_id)
+                logger.info(f"Cleared conversation history for user {user_id} in channel {channel_id}")
+            except Exception as e:
+                logger.error(f"Error clearing conversation history: {e}")
+            
             respond({
                 "response_type": "ephemeral",
-                "text": "✅ Session ended. Use `/sales` to start a new session."
+                "text": "✅ Session ended and conversation history cleared. Use `/sales` to start a fresh session."
             })
+        
+        @self.app.action("clear_history")
+        def handle_clear_history(ack, body, respond):
+            ack()
+            session_key = body['actions'][0]['value']
+            
+            # Clear conversation history from database but keep session active
+            try:
+                channel_id, user_id = session_key.split(':')
+                self._clear_conversation_history(channel_id, user_id)
+                logger.info(f"Cleared conversation history for user {user_id} in channel {channel_id}")
+                
+                respond({
+                    "response_type": "ephemeral",
+                    "text": "🧹 Conversation history cleared! Your next question will start a fresh conversation."
+                })
+            except Exception as e:
+                logger.error(f"Error clearing conversation history: {e}")
+                respond({
+                    "response_type": "ephemeral",
+                    "text": "❌ Error clearing conversation history. Please try again."
+                })
         
         @self.app.action("confirm_write")
         def handle_confirm_write(ack, body, respond):
@@ -399,13 +451,26 @@ class SlackHandler:
             # Get conversation history
             conversation_history = self._get_conversation_history(channel_id, user_id, limit=5)
             
-            # Search for relevant context
+            # Extract potential company mentions from the question for enhanced search
+            company_filter = self._extract_company_from_question(question)
+            
+            # Enhanced search for relevant context with cross-channel capabilities
+            search_query = self._enhance_search_query(question, company_filter)
+            
             context_documents = self.embedding_service.search_similar_content(
-                query=question,
+                query=search_query,
                 n_results=10,
                 channel_filter=channel_id if thread_ts else None,
-                thread_filter=thread_ts
+                thread_filter=thread_ts,
+                company_filter=company_filter
             )
+            
+            # If company mentioned, also get company-specific cross-channel results
+            if company_filter:
+                company_results = self.embedding_service.search_by_company(company_filter, n_results=8)
+                # Merge and prioritize company-specific results
+                context_documents = company_results + context_documents
+                context_documents = context_documents[:12]  # Increased from 10 to 12 for better coverage
             
             # Process query (read or write operation)
             response_data = self.generation_service.process_query(
@@ -546,6 +611,98 @@ class SlackHandler:
             logger.error(f"Error getting conversation history: {e}")
             return []
     
+    def _clear_conversation_history(self, channel_id: str, user_id: str):
+        """Clear conversation history for a specific user and channel"""
+        try:
+            with self.db_session_maker() as db_session:
+                # Delete all conversation records for this user/channel combination
+                deleted_count = db_session.query(Conversation).filter(
+                    Conversation.slack_channel_id == channel_id,
+                    Conversation.slack_user_id == user_id
+                ).delete()
+                
+                db_session.commit()
+                logger.info(f"Cleared {deleted_count} conversation records for user {user_id} in channel {channel_id}")
+                
+        except Exception as e:
+            logger.error(f"Error clearing conversation history: {e}")
+            raise
+    
+    def _extract_company_from_question(self, question: str) -> Optional[str]:
+        """Enhanced company extraction from question with contextual intelligence"""
+        if not hasattr(self.embedding_service, 'company_cache'):
+            return None
+            
+        question_lower = question.lower()
+        
+        # METHOD 1: Direct company name mentions
+        for company in self.embedding_service.company_cache:
+            if len(company) > 3 and company in question_lower:
+                return company
+        
+        # METHOD 2: Enhanced contextual patterns
+        # Look for phrases that indicate company discussions
+        company_patterns = {
+            'zillow': ['zillow', 'zillowgroup', 'zillow group', 'discussions with zillow', 'zillow in slack'],
+            'microsoft': ['microsoft', 'msft', 'discussions with microsoft', 'microsoft in slack'],
+            'meta': ['meta', 'facebook', 'discussions with meta', 'meta in slack'],
+            'google': ['google', 'alphabet', 'discussions with google', 'google in slack'],
+            'amazon': ['amazon', 'aws', 'discussions with amazon', 'amazon in slack']
+        }
+        
+        for company, patterns in company_patterns.items():
+            if company in [c.lower() for c in self.embedding_service.company_cache]:
+                for pattern in patterns:
+                    if pattern in question_lower:
+                        # Find the original cased company name
+                        for orig_company in self.embedding_service.company_cache:
+                            if orig_company.lower() == company:
+                                logger.debug(f"🎯 Enhanced company detection: '{pattern}' → {orig_company}")
+                                return orig_company
+        
+        return None
+    
+    def _enhance_search_query(self, question: str, company_filter: Optional[str] = None) -> str:
+        """Create enhanced search query that finds contextual discussions"""
+        question_lower = question.lower()
+        
+        # If asking about company discussions, enhance the query 
+        if company_filter:
+            company_lower = company_filter.lower()
+            
+            # Patterns for discussion queries
+            if any(pattern in question_lower for pattern in [
+                'discussions', 'talked about', 'conversations', 'messages', 'slack'
+            ]):
+                enhanced_query = f"conversations discussions messages communication with {company_filter} {company_lower} team members emails"
+                logger.debug(f"🔍 Enhanced search query: '{question}' → '{enhanced_query}'")
+                return enhanced_query
+            
+            # Patterns for meeting/collaboration queries
+            elif any(pattern in question_lower for pattern in [
+                'meetings', 'calls', 'demos', 'presentations'
+            ]):
+                enhanced_query = f"meetings calls demos presentations collaboration with {company_filter} {company_lower}"
+                logger.debug(f"🔍 Enhanced search query: '{question}' → '{enhanced_query}'")
+                return enhanced_query
+            
+            # Patterns for project/technical queries
+            elif any(pattern in question_lower for pattern in [
+                'project', 'integration', 'api', 'technical', 'implementation'
+            ]):
+                enhanced_query = f"project technical integration API implementation work with {company_filter} {company_lower}"
+                logger.debug(f"🔍 Enhanced search query: '{question}' → '{enhanced_query}'")
+                return enhanced_query
+        
+        # General enhancement - add context words
+        if any(pattern in question_lower for pattern in [
+            'what', 'tell me about', 'information', 'details'
+        ]):
+            return f"{question} context details information background"
+        
+        # Return original query if no enhancements needed
+        return question
+    
     def _index_slack_message(self, event: Dict[str, Any]):
         """Index a Slack message for RAG"""
         try:
@@ -599,6 +756,81 @@ class SlackHandler:
             
         except Exception as e:
             logger.error(f"Error indexing Slack message: {e}")
+    
+    def _index_slack_message_realtime(self, event: Dict[str, Any]) -> bool:
+        """Real-time indexing of Slack messages (only index if they contain relevant entities)"""
+        try:
+            message_id = event.get('ts')
+            text = event.get('text', '')
+            channel_id = event.get('channel')
+            user_id = event.get('user')
+            thread_ts = event.get('thread_ts')
+            
+            if not text or len(text) < 10:  # Skip very short messages
+                return False
+            
+            # Pre-check: Only index if message contains relevant entities (for efficiency)
+            entities = self.embedding_service.extract_entities_from_text(text)
+            has_entities = any(entities.values()) if entities else False
+            
+            if not has_entities:
+                return False  # Skip indexing - no relevant business entities found
+            
+            # Get channel and user info (with caching for real-time performance)
+            try:
+                channel_info = self.client.conversations_info(channel=channel_id)
+                channel_name = channel_info['channel']['name'] if channel_info['ok'] else f"Channel-{channel_id}"
+            except Exception:
+                channel_name = f"Channel-{channel_id}"
+            
+            try:
+                user_info = self.client.users_info(user=user_id)
+                user_name = user_info['user']['real_name'] if user_info['ok'] else f"User-{user_id}"
+            except Exception:
+                user_name = f"User-{user_id}"
+            
+            # Prepare metadata
+            metadata = {
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "user_id": user_id,
+                "user_name": user_name,
+                "ts": message_id,
+                "thread_ts": thread_ts,
+                "indexed_from": "realtime"
+            }
+            
+            # Add to embedding service (with entity awareness)
+            success = self.embedding_service.add_slack_message(
+                message_id=message_id,
+                content=text,
+                metadata=metadata
+            )
+            
+            # Save to database if successful
+            if success:
+                try:
+                    with self.db_session_maker() as db_session:
+                        slack_doc = SlackDocument(
+                            channel_id=channel_id,
+                            message_ts=message_id,
+                            thread_ts=thread_ts,
+                            user_id=user_id,
+                            content=text,
+                            doc_metadata=json.dumps(metadata),
+                            created_at=datetime.fromtimestamp(float(message_id)),
+                            is_embedded=True
+                        )
+                        db_session.add(slack_doc)
+                        db_session.commit()
+                except Exception as e:
+                    logger.error(f"Error saving real-time message to database: {e}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error in real-time message indexing: {e}")
+            return False
     
     def _show_sales_interface(self, respond, session_key):
         """Show the main sales interface (ephemeral)"""
@@ -655,6 +887,12 @@ class SlackHandler:
                         "action_id": "open_chat",
                         "value": session_key,
                         "style": "primary"
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                        "action_id": "clear_history",
+                        "value": session_key
                     },
                     {
                         "type": "button",
@@ -763,6 +1001,12 @@ class SlackHandler:
                         "type": "button",
                         "text": {"type": "plain_text", "text": "💬 Chat"},
                         "action_id": "open_chat",
+                        "value": session_key
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                        "action_id": "clear_history",
                         "value": session_key
                     }
                 ]
@@ -905,6 +1149,12 @@ class SlackHandler:
                             "action_id": "open_chat",
                             "value": session_key,
                             "style": "primary"
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                            "action_id": "clear_history",
+                            "value": session_key
                         }
                     ]
                 }
@@ -949,6 +1199,12 @@ class SlackHandler:
                                             "action_id": "open_chat",
                                             "value": session_key,
                                             "style": "primary"
+                                        },
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                                            "action_id": "clear_history",
+                                            "value": session_key
                                         }
                                     ]
                                 }
@@ -1000,6 +1256,12 @@ class SlackHandler:
                             "type": "button",
                             "text": {"type": "plain_text", "text": "💬 Chat"},
                             "action_id": "open_chat",
+                            "value": session_key
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                            "action_id": "clear_history",
                             "value": session_key
                         }
                     ]
@@ -1057,6 +1319,12 @@ class SlackHandler:
                                             "text": {"type": "plain_text", "text": "💬 Chat"},
                                             "action_id": "open_chat",
                                             "value": session_key
+                                        },
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                                            "action_id": "clear_history",
+                                            "value": session_key
                                         }
                                     ]
                                 }
@@ -1078,4 +1346,116 @@ class SlackHandler:
     async def handle_request(self, request):
         """Handle Slack request asynchronously"""
         handler = SlackRequestHandler(self.app)
-        return handler.handle(request) 
+        return handler.handle(request)
+
+    def enable_realtime_indexing(self):
+        """Enable real-time indexing of new messages"""
+        self.realtime_indexing_enabled = True
+        logger.info("🚀 Real-time Slack message indexing ENABLED")
+    
+    def disable_realtime_indexing(self):
+        """Disable real-time indexing of new messages"""
+        self.realtime_indexing_enabled = False
+        logger.info("⏸️ Real-time Slack message indexing DISABLED")
+
+    def _ensure_bot_in_channel_for_interaction(self, channel_id, channel_name):
+        """Ensure the bot is in the channel for interaction (only when user explicitly uses it)"""
+        try:
+            # Check if bot is already in channel
+            members_response = self.client.conversations_members(channel=channel_id)
+            if members_response.get('ok'):
+                bot_user_id = self.client.auth_test().get('user_id')
+                if bot_user_id in members_response.get('members', []):
+                    logger.debug(f"Bot already in #{channel_name}")
+                    return True
+            
+            # Try to join the channel since user wants to interact
+            join_response = self.client.conversations_join(channel=channel_id)
+            if join_response.get('ok'):
+                logger.info(f"🤖 Bot joined #{channel_name} for user interaction")
+                return True
+            else:
+                logger.warning(f"❌ Bot could not join #{channel_name}: {join_response.get('error')}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Error ensuring bot in #{channel_name}: {e}")
+            return False
+
+    def _show_sales_interface(self, respond, session_key):
+        """Show the main sales interface (ephemeral)"""
+        # Start a new session
+        active_sessions[session_key] = {
+            'started': datetime.utcnow(),
+            'context': []
+        }
+        
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "🤖 *Sales Assistant* (Only visible to you)\n\nWhat would you like to do?"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🔍 Search Records"},
+                        "action_id": "search_records",
+                        "value": session_key
+                    },
+                    {
+                        "type": "button", 
+                        "text": {"type": "plain_text", "text": "📝 Update Record"},
+                        "action_id": "update_record",
+                        "value": session_key
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "➕ Create New"},
+                        "action_id": "create_new",
+                        "value": session_key
+                    }
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn", 
+                    "text": "Or type your question in the channel - I'll respond privately to you."
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "💬 Chat"},
+                        "action_id": "open_chat",
+                        "value": session_key,
+                        "style": "primary"
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🧹 Clear History"},
+                        "action_id": "clear_history",
+                        "value": session_key
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🔚 End Session"},
+                        "action_id": "end_session",
+                        "value": session_key,
+                        "style": "danger"
+                    }
+                ]
+            }
+        ]
+        
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        }) 

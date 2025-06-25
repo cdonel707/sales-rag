@@ -47,7 +47,7 @@ class SalesforceClient:
             query = f"""
             SELECT Id, Name, Type, Industry, Description, Website, Phone, 
                    BillingStreet, BillingCity, BillingState, BillingCountry,
-                   AnnualRevenue, NumberOfEmployees, LastModifiedDate
+                   LastModifiedDate
             FROM Account 
             WHERE IsDeleted = false
             ORDER BY LastModifiedDate DESC
@@ -157,8 +157,6 @@ class SalesforceClient:
             Description: {record.get('Description', '')}
             Website: {record.get('Website', '')}
             Phone: {record.get('Phone', '')}
-            Annual Revenue: {record.get('AnnualRevenue', '')}
-            Employees: {record.get('NumberOfEmployees', '')}
             """
         elif object_type == 'Opportunity':
             return f"""

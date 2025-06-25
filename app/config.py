@@ -5,7 +5,8 @@ load_dotenv()
 
 class Config:
     # Slack Configuration
-    SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+    SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")  # For bot interactions
+    SLACK_USER_TOKEN = os.getenv("SLACK_USER_TOKEN")  # For data syncing (your personal token)
     SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
     SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
     
