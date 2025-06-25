@@ -28,7 +28,15 @@ class GenerationService:
         # Check if this is a write operation
         write_parser = self._get_write_parser()
         if write_parser:
-            parsed_command = write_parser.parse_write_command(question)
+            # Extract recent entities from context for better write operation parsing
+            recent_entities = self._extract_entities_from_context(context_documents, conversation_history)
+            
+            # Build user context string
+            user_context = ""
+            if conversation_history:
+                user_context = f"Recent conversation: {self._format_conversation_history(conversation_history)}"
+            
+            parsed_command = write_parser.parse_write_command(question, user_context, recent_entities)
             
             if parsed_command.get('is_write'):
                 # Handle write operation
@@ -259,4 +267,53 @@ Guidelines:
                     "timestamp": metadata.get('ts', '')
                 })
         
-        return sources 
+        return sources
+    
+    def _extract_entities_from_context(self, context_documents: List[Dict[str, Any]], 
+                                     conversation_history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, Any]]:
+        """Extract entities (Salesforce records) from context for write operation inference"""
+        entities = []
+        
+        # Extract from retrieved context documents (most recent searches)
+        for doc in context_documents:
+            metadata = doc.get('metadata', {})
+            source = doc.get('source', '')
+            
+            if source == 'salesforce':
+                entities.append({
+                    "type": "salesforce",
+                    "object_type": metadata.get('object_type', 'Unknown'),
+                    "title": metadata.get('title', 'Unknown'),
+                    "record_id": metadata.get('record_id', ''),
+                    "name": metadata.get('name', metadata.get('title', 'Unknown'))
+                })
+        
+        # Extract from conversation history (previous Q&A about specific records)
+        if conversation_history:
+            for item in conversation_history[-3:]:  # Last 3 exchanges
+                answer = item.get('answer', '')
+                # Look for Salesforce record mentions in answers
+                if 'Opportunity:' in answer or 'Account:' in answer or 'Contact:' in answer:
+                    # Simple extraction - could be more sophisticated
+                    lines = answer.split('\n')
+                    for line in lines:
+                        if 'Opportunity:' in line:
+                            name = line.split('Opportunity:')[-1].strip()
+                            entities.append({
+                                "type": "salesforce",
+                                "object_type": "Opportunity", 
+                                "title": name,
+                                "name": name,
+                                "record_id": ""
+                            })
+                        elif 'Account:' in line:
+                            name = line.split('Account:')[-1].strip()
+                            entities.append({
+                                "type": "salesforce",
+                                "object_type": "Account",
+                                "title": name, 
+                                "name": name,
+                                "record_id": ""
+                            })
+        
+        return entities 

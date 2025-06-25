@@ -16,7 +16,7 @@ class WriteOperationParser:
         self.sf_client = sf_client
         self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     
-    def parse_write_command(self, command: str, user_context: str = "") -> Dict[str, Any]:
+    def parse_write_command(self, command: str, user_context: str = "", recent_entities: List[Dict] = None) -> Dict[str, Any]:
         """Parse a natural language command to determine write operation"""
         
         # First, determine if this is a write operation
@@ -33,11 +33,26 @@ class WriteOperationParser:
         
         # Use AI to parse the command structure
         try:
+            # Include recent entities in the prompt for better context
+            recent_context = ""
+            if recent_entities:
+                recent_context = "Recent entities from conversation:\n"
+                for entity in recent_entities[:5]:  # Use last 5 entities
+                    if entity.get('type') == 'salesforce':
+                        recent_context += f"- {entity.get('object_type')}: {entity.get('title', 'Unknown')} (ID: {entity.get('record_id', 'Unknown')})\n"
+                recent_context += "\n"
+            
             prompt = f"""
             Analyze this Salesforce command and extract structured information for write operations.
             
             Command: "{command}"
             User Context: "{user_context}"
+            
+            {recent_context}
+            
+            IMPORTANT: If the user refers to "the opportunity", "the account", "the contact" etc. without naming it specifically,
+            use the most recent entity from the conversation context above. For example, if they just asked about "Zillow" 
+            and now say "update the opportunity", they mean the Zillow opportunity.
             
             Determine:
             1. Operation type (create_account, create_opportunity, create_contact, create_task, update_opportunity, update_account, update_contact, add_note)

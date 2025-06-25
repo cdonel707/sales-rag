@@ -14,8 +14,9 @@ from ..config import config
 
 logger = logging.getLogger(__name__)
 
-# In-memory store for pending write operations (in production, use Redis or database)
+# In-memory stores (in production, use Redis or database)
 pending_write_operations = {}
+active_sessions = {}  # Track ongoing conversations
 
 class SlackHandler:
     def __init__(self, embedding_service: EmbeddingService, generation_service: GenerationService,
@@ -46,67 +47,56 @@ class SlackHandler:
             
             try:
                 question = command.get('text', '').strip()
-                if not question:
-                    respond("Please provide a question after the /sales command. Example: `/sales What opportunities are closing this month?`")
-                    return
-                
                 channel_id = command.get('channel_id')
                 user_id = command.get('user_id')
                 
-                # Get user info for better context
-                user_info = self.client.users_info(user=user_id)
-                user_name = user_info['user']['real_name'] if user_info['ok'] else 'Unknown User'
+                # Start or continue session
+                session_key = f"{channel_id}:{user_id}"
                 
-                # Generate response
-                response_data = self._process_sales_question(
-                    question=question,
-                    channel_id=channel_id,
-                    user_id=user_id,
-                    user_name=user_name,
-                    thread_ts=None  # Initial command is not in a thread
-                )
-                
-                # Format response
-                response_text = self._format_response(response_data)
-                
-                # Save conversation
-                self._save_conversation(
-                    channel_id=channel_id,
-                    user_id=user_id,
-                    question=question,
-                    answer=response_data['answer'],
-                    sources=response_data['sources']
-                )
-                
-                respond(response_text)
+                if not question:
+                    # Show ephemeral interface
+                    self._show_sales_interface(respond, session_key)
+                else:
+                    # Process the question directly
+                    self._handle_sales_query(question, channel_id, user_id, respond)
                 
             except Exception as e:
                 logger.error(f"Error handling /sales command: {e}")
-                respond("Sorry, I encountered an error processing your request. Please try again.")
+                respond({
+                    "response_type": "ephemeral",
+                    "text": "Sorry, I encountered an error processing your request. Please try again."
+                })
         
         @self.app.message(".*")
-        def handle_message(message, say):
+        def handle_message(message, say, client):
             """Handle direct messages and mentions for continued conversation"""
             try:
                 logger.debug(f"Received message: {message}")
                 
-                # Only respond if bot is mentioned or in DM
-                if not self._should_respond_to_message(message):
-                    logger.debug("Not responding to this message based on _should_respond_to_message")
-                    return
-                
+                # Only respond if bot is mentioned or in DM or user has active session
                 text = message.get('text', '').strip()
                 channel_id = message.get('channel')
                 user_id = message.get('user')
                 thread_ts = message.get('thread_ts')
                 message_ts = message.get('ts')
                 
-                logger.info(f"Processing message: text='{text}', channel={channel_id}, user={user_id}, thread={thread_ts}")
-                
                 # Skip if this is a bot message
                 if message.get('bot_id'):
                     logger.debug("Skipping bot message")
                     return
+                
+                # Check if user has active session for ephemeral responses
+                session_key = f"{channel_id}:{user_id}"
+                has_active_session = session_key in active_sessions
+                
+                # Determine if we should respond and how
+                should_respond_normally = self._should_respond_to_message(message)
+                
+                if not should_respond_normally and not has_active_session:
+                    logger.debug("Not responding to this message - no mention, DM, or active session")
+                    return
+                
+                logger.info(f"Processing message: text='{text}', channel={channel_id}, user={user_id}, thread={thread_ts}, has_session={has_active_session}")
                 
                 # Get user info
                 user_info = self.client.users_info(user=user_id)
@@ -121,9 +111,6 @@ class SlackHandler:
                     thread_ts=thread_ts or message_ts
                 )
                 
-                # Format response
-                response_text = self._format_response(response_data)
-                
                 # Save conversation
                 self._save_conversation(
                     channel_id=channel_id,
@@ -134,11 +121,22 @@ class SlackHandler:
                     thread_ts=thread_ts
                 )
                 
-                # Respond in thread if this was a thread message
-                if thread_ts:
-                    say(text=response_text, thread_ts=thread_ts)
+                # Determine response method based on session and write operations
+                if has_active_session:
+                    # Respond ephemerally for users with active sessions
+                    if response_data.get('is_write') and response_data.get('requires_confirmation'):
+                        # Show ephemeral confirmation UI for write operations
+                        self._send_ephemeral_write_confirmation(client, channel_id, user_id, response_data)
+                    else:
+                        # Send ephemeral response
+                        self._send_ephemeral_response(client, channel_id, user_id, response_data)
                 else:
-                    say(text=response_text, thread_ts=message_ts)
+                    # Normal public response behavior
+                    response_text = self._format_response(response_data)
+                    if thread_ts:
+                        say(text=response_text, thread_ts=thread_ts)
+                    else:
+                        say(text=response_text, thread_ts=message_ts)
                     
             except Exception as e:
                 logger.error(f"Error handling message: {e}")
@@ -153,6 +151,177 @@ class SlackHandler:
                     self._index_slack_message(event)
             except Exception as e:
                 logger.error(f"Error indexing message: {e}")
+        
+        # Button interaction handlers
+        @self.app.action("search_records")
+        def handle_search_records(ack, body, respond):
+            ack()
+            self._handle_search_mode(body, respond)
+        
+        @self.app.action("update_record")
+        def handle_update_record(ack, body, respond):
+            ack()
+            self._handle_update_mode(body, respond)
+        
+        @self.app.action("create_new")
+        def handle_create_new(ack, body, respond):
+            ack()
+            self._handle_create_mode(body, respond)
+        
+        @self.app.action("end_session")
+        def handle_end_session(ack, body, respond):
+            ack()
+            session_key = body['actions'][0]['value']
+            if session_key in active_sessions:
+                del active_sessions[session_key]
+            respond({
+                "response_type": "ephemeral",
+                "text": "✅ Session ended. Use `/sales` to start a new session."
+            })
+        
+        @self.app.action("confirm_write")
+        def handle_confirm_write(ack, body, respond):
+            ack()
+            try:
+                # Parse the command data from button value
+                parsed_command = json.loads(body['actions'][0]['value'])
+                
+                # Execute the write operation
+                result = self.generation_service.execute_confirmed_write_operation(parsed_command)
+                
+                respond({
+                    "response_type": "ephemeral",
+                    "text": self._format_response(result)
+                })
+                
+            except Exception as e:
+                logger.error(f"Error executing confirmed write: {e}")
+                respond({
+                    "response_type": "ephemeral",
+                    "text": f"❌ Error executing operation: {str(e)}"
+                })
+        
+        @self.app.action("cancel_write")
+        def handle_cancel_write(ack, body, respond):
+            ack()
+            respond({
+                "response_type": "ephemeral",
+                "text": "❌ Write operation cancelled. No changes were made to Salesforce."
+            })
+        
+        @self.app.action("edit_write")
+        def handle_edit_write(ack, body, respond):
+            ack()
+            respond({
+                "response_type": "ephemeral",
+                "text": "✏️ To modify the operation, please use `/sales` with your updated request."
+            })
+        
+        @self.app.action("open_chat")
+        def handle_open_chat(ack, body, client):
+            ack()
+            try:
+                # Get session info from button value
+                button_value = body['actions'][0]['value']
+                
+                # Handle different button value formats
+                if button_value.startswith('{'):
+                    # JSON format
+                    parsed_value = json.loads(button_value)
+                    session_key = parsed_value.get('session_key', button_value)
+                else:
+                    # Direct session key format
+                    session_key = button_value
+                
+                # Open modal for chat input
+                client.views_open(
+                    trigger_id=body['trigger_id'],
+                    view={
+                        "type": "modal",
+                        "callback_id": "chat_modal",
+                        "title": {"type": "plain_text", "text": "💬 Sales Chat"},
+                        "submit": {"type": "plain_text", "text": "Send"},
+                        "private_metadata": session_key,
+                        "blocks": [
+                            {
+                                "type": "input",
+                                "block_id": "chat_input",
+                                "element": {
+                                    "type": "plain_text_input",
+                                    "action_id": "message",
+                                    "multiline": True,
+                                    "placeholder": {
+                                        "type": "plain_text",
+                                        "text": "Ask me anything about your Salesforce data..."
+                                    }
+                                },
+                                "label": {"type": "plain_text", "text": "Your Question"}
+                            }
+                        ]
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Error opening chat modal: {e}")
+        
+        @self.app.view("chat_modal")
+        def handle_chat_modal_submission(ack, body, view, client):
+            # Acknowledge the modal submission first
+            ack()
+            
+            try:
+                # Get the question from modal
+                question = view['state']['values']['chat_input']['message']['value']
+                session_key = view['private_metadata']
+                
+                # Parse session key to get channel and user
+                channel_id, user_id = session_key.split(':')
+                
+                # Process the question in the background and send response
+                def process_and_respond():
+                    try:
+                        # Get user info
+                        user_info = client.users_info(user=user_id)
+                        user_name = user_info['user']['real_name'] if user_info['ok'] else 'Unknown User'
+                        
+                        # Process the question
+                        response_data = self._process_sales_question(
+                            question=question,
+                            channel_id=channel_id,
+                            user_id=user_id,
+                            user_name=user_name,
+                            thread_ts=None
+                        )
+                        
+                        # Save conversation
+                        self._save_conversation(
+                            channel_id=channel_id,
+                            user_id=user_id,
+                            question=question,
+                            answer=response_data['answer'],
+                            sources=response_data['sources']
+                        )
+                        
+                        # Send response based on type
+                        if response_data.get('is_write') and response_data.get('requires_confirmation'):
+                            self._send_ephemeral_write_confirmation(client, channel_id, user_id, response_data)
+                        else:
+                            self._send_ephemeral_response(client, channel_id, user_id, response_data)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing modal question: {e}")
+                        # Send error message
+                        client.chat_postEphemeral(
+                            channel=channel_id,
+                            user=user_id,
+                            text="❌ Sorry, I encountered an error processing your question. Please try again."
+                        )
+                
+                # Process in background thread so modal can close immediately
+                import threading
+                threading.Thread(target=process_and_respond).start()
+                
+            except Exception as e:
+                logger.error(f"Error handling chat modal submission: {e}")
     
     def _should_respond_to_message(self, message: Dict[str, Any]) -> bool:
         """Determine if bot should respond to this message"""
@@ -431,6 +600,477 @@ class SlackHandler:
         except Exception as e:
             logger.error(f"Error indexing Slack message: {e}")
     
+    def _show_sales_interface(self, respond, session_key):
+        """Show the main sales interface (ephemeral)"""
+        # Start a new session
+        active_sessions[session_key] = {
+            'started': datetime.utcnow(),
+            'context': []
+        }
+        
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "🤖 *Sales Assistant* (Only visible to you)\n\nWhat would you like to do?"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🔍 Search Records"},
+                        "action_id": "search_records",
+                        "value": session_key
+                    },
+                    {
+                        "type": "button", 
+                        "text": {"type": "plain_text", "text": "📝 Update Record"},
+                        "action_id": "update_record",
+                        "value": session_key
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "➕ Create New"},
+                        "action_id": "create_new",
+                        "value": session_key
+                    }
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn", 
+                    "text": "Or type your question in the channel - I'll respond privately to you."
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "💬 Chat"},
+                        "action_id": "open_chat",
+                        "value": session_key,
+                        "style": "primary"
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🔚 End Session"},
+                        "action_id": "end_session",
+                        "value": session_key,
+                        "style": "danger"
+                    }
+                ]
+            }
+        ]
+        
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        })
+    
+    def _handle_sales_query(self, question, channel_id, user_id, respond):
+        """Handle a direct sales query"""
+        try:
+            # Get user info for better context
+            user_info = self.client.users_info(user=user_id)
+            user_name = user_info['user']['real_name'] if user_info['ok'] else 'Unknown User'
+            
+            # Generate response
+            response_data = self._process_sales_question(
+                question=question,
+                channel_id=channel_id,
+                user_id=user_id,
+                user_name=user_name,
+                thread_ts=None
+            )
+            
+            # Save conversation
+            self._save_conversation(
+                channel_id=channel_id,
+                user_id=user_id,
+                question=question,
+                answer=response_data['answer'],
+                sources=response_data['sources']
+            )
+            
+            # Handle write operations specially
+            if response_data.get('is_write'):
+                if response_data.get('requires_confirmation'):
+                    # Show ephemeral confirmation for write operations
+                    self._show_write_confirmation(respond, response_data)
+                else:
+                    # Show result ephemerally
+                    respond({
+                        "response_type": "ephemeral",
+                        "text": self._format_response(response_data)
+                    })
+            else:
+                # Show read results ephemerally
+                respond({
+                    "response_type": "ephemeral", 
+                    "text": self._format_response(response_data)
+                })
+                
+        except Exception as e:
+            logger.error(f"Error handling sales query: {e}")
+            respond({
+                "response_type": "ephemeral",
+                "text": "Sorry, I encountered an error processing your question. Please try again."
+            })
+    
+    def _show_write_confirmation(self, respond, response_data):
+        """Show ephemeral confirmation for write operations"""
+        # Get session key from parsed command if available
+        parsed_command = response_data.get('parsed_command', {})
+        channel_id = parsed_command.get('channel_id', '')
+        user_id = parsed_command.get('user_id', '')
+        session_key = f"{channel_id}:{user_id}"
+        
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"⚠️ *Salesforce Write Operation* (Only visible to you)\n\n{response_data.get('answer', '')}"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ Confirm"},
+                        "action_id": "confirm_write",
+                        "style": "primary",
+                        "value": json.dumps(parsed_command)
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Cancel"},
+                        "action_id": "cancel_write",
+                        "style": "danger"
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✏️ Edit"},
+                        "action_id": "edit_write"
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "💬 Chat"},
+                        "action_id": "open_chat",
+                        "value": session_key
+                    }
+                ]
+            }
+        ]
+        
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        })
+    
+    def _handle_search_mode(self, body, respond):
+        """Handle search records button click"""
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "🔍 *Search Mode* (Only visible to you)\n\nWhat would you like to search for?\n\n*Examples:*\n• All opportunities closing this month\n• Contacts at Zillow\n• Deals worth more than $50k\n• Recent activity on Account XYZ"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "_Type your search question in the channel or click Chat below._"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "💬 Chat"},
+                        "action_id": "open_chat",
+                        "value": body['actions'][0]['value'],
+                        "style": "primary"
+                    }
+                ]
+            }
+        ]
+        
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        })
+    
+    def _handle_update_mode(self, body, respond):
+        """Handle update record button click"""
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "📝 *Update Mode* (Only visible to you)\n\nWhat would you like to update?\n\n*Examples:*\n• Update Zillow opportunity stage to Closed Won\n• Add next steps to the ABC Corp deal\n• Change close date for opportunity XYZ to next Friday\n• Update contact John Smith's phone number"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "_Type your update request in the channel or click Chat below._"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "💬 Chat"},
+                        "action_id": "open_chat",
+                        "value": body['actions'][0]['value'],
+                        "style": "primary"
+                    }
+                ]
+            }
+        ]
+        
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        })
+    
+    def _handle_create_mode(self, body, respond):
+        """Handle create new button click"""
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "➕ *Create Mode* (Only visible to you)\n\nWhat would you like to create?\n\n*Examples:*\n• Create a new account for Company ABC\n• Add contact Jane Doe at example.com\n• Create follow-up task for tomorrow\n• New opportunity for $25k closing next quarter"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "_Type your creation request in the channel or click Chat below._"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "💬 Chat"},
+                        "action_id": "open_chat",
+                        "value": body['actions'][0]['value'],
+                        "style": "primary"
+                    }
+                ]
+            }
+        ]
+        
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        })
+    
+    def _send_ephemeral_response(self, client, channel_id, user_id, response_data):
+        """Send an ephemeral response to a user in a channel, fallback to DM if bot not in channel"""
+        try:
+            response_text = self._format_response(response_data)
+            session_key = f"{channel_id}:{user_id}"
+            
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"🤖 {response_text}\n\n_This message is only visible to you._"
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "💬 Continue Chat"},
+                            "action_id": "open_chat",
+                            "value": session_key,
+                            "style": "primary"
+                        }
+                    ]
+                }
+            ]
+            
+            try:
+                # Try ephemeral message first
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=f"🤖 {response_text}\n\n_This message is only visible to you._",
+                    blocks=blocks
+                )
+            except Exception as ephemeral_error:
+                logger.info(f"Ephemeral message failed (likely bot not in channel), sending DM instead: {ephemeral_error}")
+                
+                # Fallback to DM
+                try:
+                    # Open DM conversation with user
+                    dm_response = client.conversations_open(users=[user_id])
+                    if dm_response['ok']:
+                        dm_channel = dm_response['channel']['id']
+                        
+                        # Send DM with response
+                        client.chat_postMessage(
+                            channel=dm_channel,
+                            text=f"🤖 {response_text}\n\n_Response to your question in #{channel_id}_",
+                            blocks=[
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": f"🤖 {response_text}\n\n_Response to your question in the channel_"
+                                    }
+                                },
+                                {
+                                    "type": "actions",
+                                    "elements": [
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "💬 Continue Chat"},
+                                            "action_id": "open_chat",
+                                            "value": session_key,
+                                            "style": "primary"
+                                        }
+                                    ]
+                                }
+                            ]
+                        )
+                    else:
+                        logger.error(f"Failed to open DM with user {user_id}")
+                        
+                except Exception as dm_error:
+                    logger.error(f"Failed to send DM: {dm_error}")
+            
+        except Exception as e:
+            logger.error(f"Error sending response: {e}")
+    
+    def _send_ephemeral_write_confirmation(self, client, channel_id, user_id, response_data):
+        """Send an ephemeral write confirmation to a user in a channel, fallback to DM if bot not in channel"""
+        try:
+            session_key = f"{channel_id}:{user_id}"
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"⚠️ *Salesforce Write Operation* (Only visible to you)\n\n{response_data.get('answer', '')}"
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ Confirm"},
+                            "action_id": "confirm_write",
+                            "style": "primary",
+                            "value": json.dumps(response_data.get('parsed_command', {}))
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ Cancel"},
+                            "action_id": "cancel_write",
+                            "style": "danger"
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✏️ Edit"},
+                            "action_id": "edit_write"
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "💬 Chat"},
+                            "action_id": "open_chat",
+                            "value": session_key
+                        }
+                    ]
+                }
+            ]
+            
+            try:
+                # Try ephemeral message first
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text="⚠️ Salesforce Write Operation Confirmation",
+                    blocks=blocks
+                )
+            except Exception as ephemeral_error:
+                logger.info(f"Ephemeral confirmation failed (likely bot not in channel), sending DM instead: {ephemeral_error}")
+                
+                # Fallback to DM
+                try:
+                    # Open DM conversation with user
+                    dm_response = client.conversations_open(users=[user_id])
+                    if dm_response['ok']:
+                        dm_channel = dm_response['channel']['id']
+                        
+                        # Send DM with confirmation
+                        client.chat_postMessage(
+                            channel=dm_channel,
+                            text="⚠️ Salesforce Write Operation Confirmation",
+                            blocks=[
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": f"⚠️ *Salesforce Write Operation*\n\n{response_data.get('answer', '')}\n\n_Response to your question in the channel_"
+                                    }
+                                },
+                                {
+                                    "type": "actions",
+                                    "elements": [
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "✅ Confirm"},
+                                            "action_id": "confirm_write",
+                                            "style": "primary",
+                                            "value": json.dumps(response_data.get('parsed_command', {}))
+                                        },
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "❌ Cancel"},
+                                            "action_id": "cancel_write",
+                                            "style": "danger"
+                                        },
+                                        {
+                                            "type": "button",
+                                            "text": {"type": "plain_text", "text": "💬 Chat"},
+                                            "action_id": "open_chat",
+                                            "value": session_key
+                                        }
+                                    ]
+                                }
+                            ]
+                        )
+                    else:
+                        logger.error(f"Failed to open DM with user {user_id}")
+                        
+                except Exception as dm_error:
+                    logger.error(f"Failed to send DM: {dm_error}")
+            
+        except Exception as e:
+            logger.error(f"Error sending write confirmation: {e}")
+
     def get_handler(self):
         """Get the FastAPI request handler"""
         return SlackRequestHandler(self.app)
