@@ -20,11 +20,12 @@ active_sessions = {}  # Track ongoing conversations
 
 class SlackHandler:
     def __init__(self, embedding_service: EmbeddingService, generation_service: GenerationService,
-                 salesforce_client: SalesforceClient, db_session_maker):
+                 salesforce_client: SalesforceClient, db_session_maker, sales_rag_service=None):
         self.embedding_service = embedding_service
         self.generation_service = generation_service
         self.salesforce_client = salesforce_client
         self.db_session_maker = db_session_maker
+        self.sales_rag_service = sales_rag_service  # Store reference to parent service
         
         # Real-time indexing control
         self.realtime_indexing_enabled = False
@@ -454,23 +455,67 @@ class SlackHandler:
             # Extract potential company mentions from the question for enhanced search
             company_filter = self._extract_company_from_question(question)
             
-            # Enhanced search for relevant context with cross-channel capabilities
+            # Enhanced search for relevant context with cross-channel capabilities AND Fathom integration
             search_query = self._enhance_search_query(question, company_filter)
             
-            context_documents = self.embedding_service.search_similar_content(
-                query=search_query,
-                n_results=10,
-                channel_filter=channel_id if thread_ts else None,
-                thread_filter=thread_ts,
-                company_filter=company_filter
-            )
-            
-            # If company mentioned, also get company-specific cross-channel results
-            if company_filter:
-                company_results = self.embedding_service.search_by_company(company_filter, n_results=8)
-                # Merge and prioritize company-specific results
-                context_documents = company_results + context_documents
-                context_documents = context_documents[:12]  # Increased from 10 to 12 for better coverage
+            # Use the enhanced search with Fathom integration via the stored service reference
+            if self.sales_rag_service and hasattr(self.sales_rag_service, 'search_sales_data'):
+                try:
+                    import asyncio
+                    
+                    # Handle async call - check if we're already in an event loop
+                    try:
+                        # Try to get the running loop
+                        loop = asyncio.get_running_loop()
+                        # If we're in a loop, we need to run in a thread
+                        import concurrent.futures
+                        import threading
+                        
+                        def run_search():
+                            return asyncio.run(self.sales_rag_service.search_sales_data(
+                                query=search_query,
+                                source_filter=None
+                            ))
+                        
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(run_search)
+                            enhanced_result = future.result(timeout=30)
+                            
+                    except RuntimeError:
+                        # No running loop, safe to use asyncio.run
+                        enhanced_result = asyncio.run(self.sales_rag_service.search_sales_data(
+                            query=search_query,
+                            source_filter=None  # Let it search all sources
+                        ))
+                    
+                    # Extract context documents from the enhanced result
+                    context_documents = enhanced_result.get('context_documents', [])
+                    
+                    # Log Fathom integration status
+                    debug_info = enhanced_result.get('debug_info', {})
+                    fathom_meetings_found = debug_info.get('fathom_meetings_found', 0)
+                    logger.info(f"🎯 Slack handler: Enhanced search found {fathom_meetings_found} Fathom meetings")
+                    
+                except Exception as e:
+                    logger.error(f"Error using enhanced search, falling back to basic search: {e}")
+                    # Fallback to basic search
+                    context_documents = self.embedding_service.search_similar_content(
+                        query=search_query,
+                        n_results=10,
+                        channel_filter=channel_id if thread_ts else None,
+                        thread_filter=thread_ts,
+                        company_filter=company_filter
+                    )
+            else:
+                # Fallback if service not available
+                logger.warning("Sales RAG service not available, using basic search")
+                context_documents = self.embedding_service.search_similar_content(
+                    query=search_query,
+                    n_results=10,
+                    channel_filter=channel_id if thread_ts else None,
+                    thread_filter=thread_ts,
+                    company_filter=company_filter
+                )
             
             # Process query (read or write operation)
             response_data = self.generation_service.process_query(

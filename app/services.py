@@ -9,6 +9,7 @@ import time
 from .rag.embeddings import EmbeddingService
 from .rag.generation import GenerationService
 from .salesforce.client import SalesforceClient
+from .fathom.client import FathomClient
 from .slack.handlers import SlackHandler
 from .database.models import SalesforceDocument
 from .config import config
@@ -31,16 +32,22 @@ class SalesRAGService:
             domain=config.SALESFORCE_DOMAIN
         )
         
+        # Initialize Fathom client
+        self.fathom_client = FathomClient(
+            api_key=config.FATHOM_API_KEY
+        )
+        
         # Initialize embedding service
         self.embedding_service = EmbeddingService(
             openai_api_key=config.OPENAI_API_KEY,
             chroma_path="./chroma_db"
         )
         
-        # Initialize generation service with salesforce client
+        # Initialize generation service with salesforce and fathom clients
         self.generation_service = GenerationService(
             openai_api_key=config.OPENAI_API_KEY,
-            sf_client=self.salesforce_client
+            sf_client=self.salesforce_client,
+            fathom_client=self.fathom_client
         )
         
         # Initialize dual Slack clients
@@ -51,7 +58,8 @@ class SalesRAGService:
             embedding_service=self.embedding_service,
             generation_service=self.generation_service,
             salesforce_client=self.salesforce_client,
-            db_session_maker=self.db_session_maker
+            db_session_maker=self.db_session_maker,
+            sales_rag_service=self  # Pass self reference for enhanced search
         )
     
     def _setup_slack_clients(self):
@@ -650,12 +658,21 @@ class SalesRAGService:
                                thread_context: Optional[list] = None,
                                conversation_history: Optional[list] = None,
                                company_filter: Optional[str] = None) -> dict:
-        """Search sales data using RAG with enhanced cross-channel search"""
+        """Search sales data using RAG with enhanced cross-channel and Fathom meeting search"""
+        logger.info(f"🚀 SEARCH CALLED: query='{query}', source_filter={source_filter}")
+        
+        # Initialize debug info
+        debug_info = {
+            "query_received": query,
+            "fathom_available": self.fathom_client.is_available() if hasattr(self, 'fathom_client') else False,
+            "function_entered": True
+        }
+        
         try:
             # Enhanced search with company filtering
             context_documents = self.embedding_service.search_similar_content(
                 query=query,
-                n_results=10,
+                n_results=8,  # Reduced to make room for Fathom results
                 source_filter=source_filter,
                 channel_filter=channel_filter,
                 thread_filter=thread_filter,
@@ -666,10 +683,98 @@ class SalesRAGService:
             if company_filter or self._contains_company_mention(query):
                 company_name = company_filter or self._extract_company_from_query(query)
                 if company_name:
-                    company_results = self.embedding_service.search_by_company(company_name, n_results=5)
+                    company_results = self.embedding_service.search_by_company(company_name, n_results=3)
                     # Merge results, prioritizing company-specific ones
                     context_documents = company_results + context_documents
-                    context_documents = context_documents[:10]  # Keep top 10
+                    context_documents = context_documents[:8]  # Keep top 8
+            
+            # Add Fathom meeting search results - ALWAYS search Fathom for every query
+            fathom_meetings = []
+            logger.info(f"🔍 Fathom client available: {self.fathom_client.is_available()}")
+            logger.info(f"🔑 Fathom API key configured: {'Yes' if self.fathom_client.api_key else 'No'}")
+            
+            if self.fathom_client.is_available():
+                # Always search Fathom to ensure comprehensive results
+                should_search_meetings = True  # ALWAYS include Fathom search
+                meeting_keywords_detected = self._should_include_meeting_data(query)
+                logger.info(f"🎯 Meeting keywords detected: {meeting_keywords_detected}")
+                logger.info(f"🎯 ALWAYS including Fathom meeting data for comprehensive search")
+                
+                if should_search_meetings:
+                    logger.info(f"🎯 Including Fathom meeting data for query: {query}")
+                    
+                    try:
+                        # Add timeout to prevent hanging
+                        import asyncio
+                        
+                        # Enhanced search strategy: Use Salesforce-integrated approach when possible
+                        company_name = company_filter or self._extract_company_from_query(query)
+                        
+                        if company_name:
+                            logger.info(f"📞 Using Salesforce-integrated search for company: {company_name}")
+                            # Use the new Salesforce-integrated search method
+                            fathom_meetings = await asyncio.wait_for(
+                                self.fathom_client.search_meetings_by_salesforce_contacts(
+                                    salesforce_client=self.salesforce_client,
+                                    company_name=company_name,
+                                    limit=5
+                                ),
+                                timeout=20.0  # Longer timeout for Salesforce integration
+                            )
+                            
+                            # Fallback to legacy company search if no results
+                            if not fathom_meetings:
+                                logger.info(f"📞 Fallback: Using legacy company search for: {company_name}")
+                                fathom_meetings = await asyncio.wait_for(
+                                    self.fathom_client.search_meetings_by_company(company_name, limit=3),
+                                    timeout=15.0
+                                )
+                        else:
+                            # For general queries, use standard meeting search
+                            logger.info(f"📞 Searching Fathom meetings for general query: '{query}'")
+                            fathom_meetings = await asyncio.wait_for(
+                                self.fathom_client.search_meetings_by_query(query, limit=5),
+                                timeout=15.0
+                            )
+                        
+                        logger.info(f"🔍 Fathom API returned {len(fathom_meetings)} meetings")
+                        
+                        if fathom_meetings:
+                            logger.info(f"✅ Found {len(fathom_meetings)} relevant Fathom meetings")
+                            # Format meetings as context documents
+                            fathom_context = []
+                            for i, meeting in enumerate(fathom_meetings):
+                                logger.debug(f"Formatting meeting {i+1}: {meeting.get('title', 'Untitled')}")
+                                formatted_meeting = self.fathom_client.format_meeting_for_context(meeting)
+                                matched_email = meeting.get('_matched_email', '')
+                                fathom_context.append({
+                                    'content': formatted_meeting,
+                                    'source': 'fathom',  # Move source to root level
+                                    'metadata': {
+                                        'type': 'meeting',
+                                        'title': meeting.get('title', 'Meeting'),
+                                        'date': meeting.get('created_at', ''),
+                                        'meeting_url': meeting.get('share_url', meeting.get('url', '')),
+                                        'matched_email': matched_email  # Track which Salesforce contact matched
+                                    }
+                                })
+                            
+                            # Add Fathom meetings to context (prioritize them at the beginning)
+                            context_documents = fathom_context + context_documents
+                            context_documents = context_documents[:12]  # Increase limit to accommodate meetings
+                            logger.info(f"📋 Total context documents: {len(context_documents)} (including {len(fathom_context)} meetings)")
+                        else:
+                            logger.info("ℹ️ No relevant Fathom meetings found")
+                    
+                    except asyncio.TimeoutError:
+                        logger.warning("⏰ Fathom search timed out")
+                        fathom_meetings = []
+                    except Exception as e:
+                        logger.error(f"❌ Error searching Fathom meetings: {e}")
+                        fathom_meetings = []
+                # Note: We now ALWAYS search Fathom - no conditional exclusion
+            else:
+                logger.warning("⚠️ Fathom client not available")
             
             # Process query (read or write operation)
             response_data = self.generation_service.process_query(
@@ -679,15 +784,28 @@ class SalesRAGService:
                 conversation_history=conversation_history
             )
             
+            # Add debug information
+            debug_info.update({
+                "fathom_meetings_found": len(fathom_meetings),
+                "fathom_always_searched": True,  # Now always searching Fathom
+                "meeting_keywords_detected": self._should_include_meeting_data(query),
+                "total_context_docs": len(context_documents),
+                "success": True
+            })
+            response_data["debug_info"] = debug_info
+            response_data["context_documents"] = context_documents  # Include context documents in response
+            
             return response_data
             
         except Exception as e:
             logger.error(f"Error processing query: {e}")
+            debug_info["error"] = str(e)
             return {
                 "answer": "I apologize, but I encountered an error while processing your request. Please try again.",
                 "sources": [],
                 "context_used": 0,
-                "thread_context_used": 0
+                "thread_context_used": 0,
+                "debug_info": debug_info
             }
     
     def _contains_company_mention(self, query: str) -> bool:
@@ -702,6 +820,62 @@ class SalesRAGService:
             if len(company) > 3 and company in query_lower:
                 return company
         return None
+    
+    def _should_include_meeting_data(self, query: str) -> bool:
+        """Determine if query contains meeting-related keywords (for logging purposes - we now always search Fathom)"""
+        query_lower = query.lower()
+        logger.info(f"🔍 Analyzing query for meeting keywords: '{query_lower}'")
+        
+        # Fathom-specific keywords (always include)
+        fathom_keywords = ['fathom', 'recording', 'recordings', 'transcript', 'transcripts']
+        if any(keyword in query_lower for keyword in fathom_keywords):
+            logger.info(f"🎯 Fathom keyword detected: {[kw for kw in fathom_keywords if kw in query_lower]}")
+            return True
+        
+        # Meeting-related keywords (expanded list)
+        meeting_keywords = [
+            'call', 'calls', 'meeting', 'meetings', 'demo', 'demos',
+            'discussion', 'conversation', 'talked', 'spoke', 'said',
+            'onboarding', 'kickoff', 'sync', 'standup', 'follow-up',
+            'interview', 'presentation', 'walkthrough', 'review',
+            'chat', 'video call', 'zoom', 'teams', 'voice call'
+        ]
+        
+        # Check for meeting keywords
+        found_keywords = [kw for kw in meeting_keywords if kw in query_lower]
+        if found_keywords:
+            logger.info(f"🎯 Meeting keywords detected: {found_keywords}")
+            return True
+        
+        # Check for specific company mentions (likely to have meetings)
+        if self._contains_company_mention(query):
+            company_name = self._extract_company_from_query(query)
+            logger.info(f"🎯 Company mention detected: {company_name}")
+            return True
+        
+        # Check for action items or outcomes
+        action_keywords = ['action items', 'next steps', 'follow up', 'decided', 'agreed', 'discussed']
+        found_action_keywords = [kw for kw in action_keywords if kw in query_lower]
+        if found_action_keywords:
+            logger.info(f"🎯 Action keywords detected: {found_action_keywords}")
+            return True
+        
+        # Check for people-related queries (meetings often have participants)
+        people_keywords = ['who', 'participants', 'attendees', 'team', 'client', 'customer']
+        found_people_keywords = [kw for kw in people_keywords if kw in query_lower]
+        if found_people_keywords:
+            logger.info(f"🎯 People keywords detected: {found_people_keywords}")
+            return True
+        
+        # Check for time-related or outcome queries that might reference meetings
+        time_keywords = ['yesterday', 'today', 'last week', 'recently', 'latest']
+        found_time_keywords = [kw for kw in time_keywords if kw in query_lower]
+        if found_time_keywords:
+            logger.info(f"🎯 Time keywords detected: {found_time_keywords}")
+            return True
+        
+        logger.info(f"ℹ️ No specific meeting keywords found in query: '{query_lower}' (but still searching Fathom)")
+        return False
     
     async def refresh_cross_channel_index(self):
         """Refresh cross-channel index with latest Slack data"""
@@ -737,6 +911,7 @@ class SalesRAGService:
         """Perform health check on all services"""
         health_status = {
             "salesforce": False,
+            "fathom": False,
             "openai": False,
             "vector_db": False,
             "database": False,
@@ -746,6 +921,9 @@ class SalesRAGService:
         try:
             # Check Salesforce connection
             health_status["salesforce"] = self.salesforce_client.connect()
+            
+            # Check Fathom connection
+            health_status["fathom"] = self.fathom_client.is_available()
             
             # Check OpenAI (try a simple embedding)
             try:

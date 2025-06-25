@@ -16,6 +16,9 @@ class Config:
     SALESFORCE_SECURITY_TOKEN = os.getenv("SALESFORCE_SECURITY_TOKEN")
     SALESFORCE_DOMAIN = os.getenv("SALESFORCE_DOMAIN")
     
+    # Fathom Configuration
+    FATHOM_API_KEY = os.getenv("FATHOM_API_KEY")
+    
     # OpenAI Configuration
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     

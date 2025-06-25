@@ -118,7 +118,7 @@ class WriteOperationParser:
             """
             
             response = self.openai_client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are a Salesforce command parser. Always respond with valid JSON."},
                     {"role": "user", "content": prompt}

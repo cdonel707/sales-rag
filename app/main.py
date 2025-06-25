@@ -207,6 +207,107 @@ async def execute_write_operation(parsed_command: dict):
     
     return result
 
+# Fathom meeting search endpoints
+from pydantic import BaseModel
+
+class FathomCompanySearchRequest(BaseModel):
+    company_name: str
+    limit: int = 10
+
+class FathomQuerySearchRequest(BaseModel):
+    query: str
+    limit: int = 10
+
+class FathomSalesforceSearchRequest(BaseModel):
+    company_name: str
+    limit: int = 10
+
+@app.post("/fathom/search-company")
+async def search_fathom_by_company(request: FathomCompanySearchRequest):
+    """Search Fathom meetings by company name (legacy method)"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not sales_rag_service.fathom_client.is_available():
+        raise HTTPException(status_code=503, detail="Fathom integration not available")
+    
+    if not request.company_name.strip():
+        raise HTTPException(status_code=400, detail="Company name cannot be empty")
+    
+    try:
+        meetings = await sales_rag_service.fathom_client.search_meetings_by_company(
+            request.company_name, limit=request.limit
+        )
+        
+        return {
+            "company": request.company_name,
+            "method": "legacy_company_search",
+            "meetings_found": len(meetings),
+            "meetings": meetings
+        }
+    except Exception as e:
+        logger.error(f"Error searching Fathom meetings for company {request.company_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error searching meetings: {str(e)}")
+
+@app.post("/fathom/search-salesforce-integrated")
+async def search_fathom_by_salesforce_contacts(request: FathomSalesforceSearchRequest):
+    """Search Fathom meetings using Salesforce contact emails (enhanced method)"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not sales_rag_service.fathom_client.is_available():
+        raise HTTPException(status_code=503, detail="Fathom integration not available")
+    
+    if not request.company_name.strip():
+        raise HTTPException(status_code=400, detail="Company name cannot be empty")
+    
+    try:
+        meetings = await sales_rag_service.fathom_client.search_meetings_by_salesforce_contacts(
+            salesforce_client=sales_rag_service.salesforce_client,
+            company_name=request.company_name,
+            limit=request.limit
+        )
+        
+        # Extract matched emails for debugging
+        matched_emails = [m.get('_matched_email', '') for m in meetings if m.get('_matched_email')]
+        
+        return {
+            "company": request.company_name,
+            "method": "salesforce_integrated_search",
+            "meetings_found": len(meetings),
+            "matched_emails": list(set(matched_emails)),  # Unique emails that matched
+            "meetings": meetings
+        }
+    except Exception as e:
+        logger.error(f"Error searching Fathom meetings via Salesforce for company {request.company_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error searching meetings: {str(e)}")
+
+@app.post("/fathom/search-query")
+async def search_fathom_by_query(request: FathomQuerySearchRequest):
+    """Search Fathom meetings by general query"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not sales_rag_service.fathom_client.is_available():
+        raise HTTPException(status_code=503, detail="Fathom integration not available")
+    
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
+    try:
+        meetings = await sales_rag_service.fathom_client.search_meetings_by_query(
+            request.query, limit=request.limit
+        )
+        
+        return {
+            "query": request.query,
+            "meetings_found": len(meetings),
+            "meetings": meetings
+        }
+    except Exception as e:
+        logger.error(f"Error searching Fathom meetings for query {request.query}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error searching meetings: {str(e)}")
+
 # Background sync endpoint - non-blocking
 @app.post("/sync/background-comprehensive")
 async def start_background_comprehensive_sync():
@@ -264,14 +365,17 @@ async def root():
             }
         },
         "endpoints": {
-            "health": "/health - Check system health with cross-channel status",
+            "health": "/health - Check system health with cross-channel and Fathom status",
             "slack_events": "/slack/events - Slack bot interactions with enhanced intelligence", 
             "sync_salesforce": "/sync/salesforce - Sync Salesforce data with entity caching",
             "sync_background": "⭐ /sync/background-comprehensive - NON-BLOCKING comprehensive sync (RECOMMENDED)",
             "sync_slack_manual": "/sync/slack-channels - Enhanced manual sync (BLOCKS app during sync)",
             "sync_slack_automated": "/sync/slack-automated - Enhanced automated sync (150 channels)",
             "enable_realtime": "/enable-realtime - Enable real-time indexing of new messages",
-            "search": "/search - Test search functionality with company filtering",
+            "search": "/search - Test search functionality with company filtering and Fathom meetings",
+            "fathom_search_company": "/fathom/search-company - Search Fathom meetings by company name (legacy)",
+            "fathom_search_salesforce": "⭐ /fathom/search-salesforce-integrated - Search via Salesforce contact emails (ENHANCED)",
+            "fathom_search_query": "/fathom/search-query - Search Fathom meetings by general query",
             "debug_entities": "/debug/entities - Check entity cache status"
         },
         "intelligence_features": {

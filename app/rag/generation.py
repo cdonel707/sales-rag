@@ -6,9 +6,10 @@ import json
 logger = logging.getLogger(__name__)
 
 class GenerationService:
-    def __init__(self, openai_api_key: str, sf_client=None):
+    def __init__(self, openai_api_key: str, sf_client=None, fathom_client=None):
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
         self.sf_client = sf_client
+        self.fathom_client = fathom_client
         self.write_parser = None
     
     def _get_write_parser(self):
@@ -131,7 +132,7 @@ class GenerationService:
             
             # Generate response
             response = self.openai_client.chat.completions.create(
-                model="gpt-4-turbo-preview",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -162,21 +163,23 @@ class GenerationService:
             }
     
     def _create_system_prompt(self) -> str:
-        return """You are a helpful AI assistant that answers questions based on Salesforce data and Slack conversations. 
+        return """You are a helpful AI assistant that answers questions based on Salesforce data, Slack conversations, and Fathom call recordings. 
 
 Your role is to:
-1. Answer questions using the provided context from Salesforce records and Slack messages
+1. Answer questions using the provided context from Salesforce records, Slack messages, and Fathom meeting transcripts
 2. Be accurate and only use information from the provided context
 3. If the context doesn't contain relevant information, say so clearly
 4. Prioritize thread context when answering questions in a thread
 5. Provide specific details from Salesforce records when relevant (amounts, dates, names, etc.)
-6. Be conversational and helpful while maintaining professionalism
-7. If you reference specific data, mention the source (Salesforce record type or Slack conversation)
+6. Reference call transcripts and meeting summaries from Fathom when discussing conversations, decisions, or action items
+7. Be conversational and helpful while maintaining professionalism
+8. If you reference specific data, mention the source (Salesforce record type, Slack conversation, or Fathom meeting)
 
 Guidelines:
 - Always base your answers on the provided context
 - Don't make up information not present in the context
 - Be clear about what information is available vs. not available
+- When referencing meetings, include relevant details like participants, dates, and key outcomes
 - Use a helpful, professional tone suitable for business communications"""
 
     def _create_user_prompt(self, question: str, retrieved_context: str, 
@@ -215,6 +218,10 @@ Guidelines:
                 channel_name = metadata.get('channel_name', 'Unknown Channel')
                 user_name = metadata.get('user_name', 'Unknown User')
                 formatted_docs.append(f"[Slack #{channel_name} - {user_name}] {content}")
+            elif source == 'fathom':
+                meeting_title = metadata.get('title', 'Meeting')
+                meeting_date = metadata.get('date', 'Unknown Date')
+                formatted_docs.append(f"[Fathom Meeting: {meeting_title} - {meeting_date}] {content}")
             else:
                 formatted_docs.append(f"[{source}] {content}")
         
@@ -265,6 +272,13 @@ Guidelines:
                     "channel": metadata.get('channel_name', 'Unknown Channel'),
                     "user": metadata.get('user_name', 'Unknown User'),
                     "timestamp": metadata.get('ts', '')
+                })
+            elif source == 'fathom':
+                sources.append({
+                    "type": metadata.get('type', 'meeting'),  # Use metadata type (should be 'meeting')
+                    "title": metadata.get('title', 'Meeting'),
+                    "date": metadata.get('date', 'Unknown Date'),
+                    "meeting_url": metadata.get('meeting_url', '')
                 })
         
         return sources
