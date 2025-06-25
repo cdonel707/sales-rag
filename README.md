@@ -10,6 +10,11 @@ A powerful Slack bot that integrates Salesforce data with Slack conversations us
 - **Context-Aware**: Prioritizes thread context and conversation history
 - **Continuous Learning**: Indexes Slack messages for improved context
 - **Real-time Data**: Keeps Salesforce data synchronized
+- **✨ Write Operations**: Create and update Salesforce records directly from Slack
+  - Create new Opportunities, Accounts, Contacts, and Tasks
+  - Update existing records (stages, amounts, etc.)
+  - Add notes and activities to records
+  - AI-powered natural language parsing with confirmation flow
 
 ## Architecture
 
@@ -115,11 +120,20 @@ DEBUG=false
    - Password: Your Salesforce password
    - Security Token: From Setup → Personal Information → Reset My Security Token
 
-2. Ensure your Salesforce user has API access and permissions to read:
+2. Ensure your Salesforce user has API access and permissions to:
+   
+   **Read Access:**
    - Accounts
    - Opportunities
    - Contacts
    - Cases
+   
+   **Write Access (for new write operations):**
+   - Create/Edit Accounts
+   - Create/Edit Opportunities  
+   - Create/Edit Contacts
+   - Create Tasks
+   - Create Notes
 
 ### 5. Running the Application
 
@@ -146,10 +160,38 @@ docker-compose up -d
 ## Usage
 
 ### Slash Command
+
+**Read Operations (Search & Query):**
 ```
 /sales What opportunities are closing this month?
 /sales Show me all accounts in the technology sector
 /sales Who are the contacts at Acme Corp?
+/sales What's the status of the Zillow deal?
+```
+
+**Write Operations (Create & Update):**
+```
+/sales Create a new opportunity called "Q1 2024 Expansion" for Acme Corp worth $50,000 closing next month
+/sales Add a contact named John Smith at Microsoft with email john@microsoft.com
+/sales Create a new account for "TechStart Inc" in the software industry
+/sales Add a note to the Zillow opportunity: "Customer expressed interest in premium features"
+/sales Create a task to "Follow up on pricing discussion" for next week
+/sales Update the Acme Corp opportunity stage to "Needs Analysis"
+```
+
+### Write Operation Confirmation Flow
+Write operations require explicit confirmation for safety:
+```
+User: /sales Create a new opportunity for Acme Corp worth $25,000
+Bot: ⚠️ Salesforce Write Operation Detected
+
+I'll create a new opportunity called "Acme Corp Opportunity" for account "Acme Corp" 
+with amount $25,000 and close date 2024-02-15.
+
+Please confirm: Reply with 'yes' to proceed or 'no' to cancel.
+
+User: yes
+Bot: ✅ Successfully created Opportunity 'Acme Corp Opportunity' for Acme Corp (ID: 006xx000004TmiQAAS)
 ```
 
 ### Thread Conversations
@@ -160,6 +202,9 @@ Bot: Based on the context from our previous discussion...
 
 User: What's the contact information for that account?
 Bot: Here are the contacts for [Account Name]...
+
+User: Create a follow-up task for this opportunity
+Bot: ⚠️ I'll create a task "Follow up on opportunity" linked to [Opportunity Name]...
 ```
 
 ### Direct Messages
@@ -174,6 +219,25 @@ You can also DM the bot directly or mention it in channels:
 - `POST /slack/events` - Slack events webhook
 - `POST /sync/salesforce` - Manual data sync
 - `POST /search` - Direct search (for testing)
+- `POST /write` - Execute write operations (for testing)
+
+### Write Operations API
+Test write operations directly via API:
+```bash
+# Test opportunity creation
+curl -X POST "http://localhost:3000/write" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operation": "create_opportunity",
+    "data": {
+      "Name": "Test Opportunity",
+      "StageName": "Prospecting", 
+      "CloseDate": "2024-03-15",
+      "Amount": 50000
+    },
+    "needs_lookup": [{"object": "Account", "name": "Acme Corp"}]
+  }'
+```
 
 ## Data Synchronization
 
@@ -280,6 +344,13 @@ docker-compose logs -f
    - Processing happens asynchronously
    - Check logs for background processing errors
 
+6. **Write operation errors**
+   - Ensure Salesforce user has create/edit permissions
+   - Check for required field validation errors
+   - Verify account/contact lookups are working
+   - Confirm date formats are valid (YYYY-MM-DD)
+   - Check Salesforce API limits and usage
+
 ### Logging
 
 Enable debug logging by setting `DEBUG=true` in `.env`
@@ -312,6 +383,13 @@ ngrok http 3000
 3. **Data Privacy**: Be mindful of Salesforce data in logs
 4. **Access Control**: Limit Slack app permissions to necessary scopes
 5. **API Keys**: Rotate keys regularly and monitor usage
+6. **Write Operations Security**:
+   - All write operations require explicit user confirmation
+   - Commands are parsed by AI for safety validation
+   - Salesforce permissions control what can be created/modified
+   - Consider restricting write operations to specific Slack channels/users
+   - Monitor Salesforce audit logs for write operations
+   - Set up alerts for high-value record creation (large opportunity amounts)
 
 ## Contributing
 

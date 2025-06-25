@@ -1,8 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 import logging
-import asyncio
-import httpx
 from contextlib import asynccontextmanager
 
 from .database.models import create_database, get_session_maker
@@ -19,43 +17,7 @@ logger = logging.getLogger(__name__)
 # Global service instance
 sales_rag_service = None
 
-async def process_sales_question_async(query: str, response_url: str):
-    """Process sales question asynchronously and send response to Slack"""
-    try:
-        # Process the sales question
-        result = await sales_rag_service.search_sales_data(query=query)
-        response_text = result.get('answer', 'Sorry, I could not find relevant information.')
-        
-        # Add sources if available
-        sources = result.get('sources', [])
-        if sources:
-            response_text += "\n\n*Sources:*"
-            for source in sources[:3]:
-                if source.get('type') == 'salesforce':
-                    response_text += f"\n• Salesforce {source.get('object_type', 'Record')}"
-                elif source.get('type') == 'slack':
-                    response_text += f"\n• Slack #{source.get('channel', 'Unknown')}"
-        
-        # Send response back to Slack
-        async with httpx.AsyncClient() as client:
-            await client.post(response_url, json={
-                "response_type": "in_channel",
-                "text": response_text,
-                "replace_original": True
-            })
-            
-    except Exception as e:
-        logger.error(f"Error processing async sales question: {e}")
-        # Send error response to Slack
-        try:
-            async with httpx.AsyncClient() as client:
-                await client.post(response_url, json={
-                    "response_type": "in_channel", 
-                    "text": "Sorry, I encountered an error processing your question. Please try again.",
-                    "replace_original": True
-                })
-        except:
-            pass  # If we can't send error response, just log it
+# Removed async function - now using full Slack Bolt integration
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -116,51 +78,17 @@ async def health_check():
     
     return health_status
 
-# Slack events endpoint - simplified version
+# Slack events endpoint - full Slack Bolt integration
 @app.post("/slack/events")
 async def slack_events(request: Request):
-    """Handle Slack events"""
+    """Handle all Slack events through Slack Bolt"""
     if not sales_rag_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
     try:
-        # Check content type to determine how to parse the request
-        content_type = request.headers.get("content-type", "")
-        
-        if "application/json" in content_type:
-            # Handle URL verification challenge (JSON format)
-            body = await request.json()
-            if body.get("type") == "url_verification":
-                return {"challenge": body.get("challenge")}
-            return {"status": "ok"}
-        
-        elif "application/x-www-form-urlencoded" in content_type:
-            # Handle slash commands (form data format)
-            form_data = await request.form()
-            command = form_data.get("command")
-            
-            if command == "/sales":
-                text = form_data.get("text", "").strip()
-                if not text:
-                    return {"text": "Please provide a question after the /sales command. Example: `/sales What opportunities are closing this month?`"}
-                
-                # Get response_url for delayed response
-                response_url = form_data.get("response_url")
-                
-                # Immediately acknowledge the command
-                response = {
-                    "response_type": "in_channel",
-                    "text": f"🔍 Searching for information about: *{text}*\n_Please wait while I analyze your Salesforce data..._"
-                }
-                
-                # Process the sales question asynchronously
-                if response_url:
-                    asyncio.create_task(process_sales_question_async(text, response_url))
-                
-                return response
-        
-        # Handle other cases
-        return {"status": "ok"}
+        # Get the Slack handler and delegate to it
+        slack_handler = sales_rag_service.get_slack_handler()
+        return await slack_handler.handle(request)
         
     except Exception as e:
         logger.error(f"Error handling Slack request: {e}")
@@ -197,6 +125,20 @@ async def search_sales_data(query: str, source_filter: str = None):
     
     return result
 
+# Write operation endpoint for testing
+@app.post("/write")
+async def execute_write_operation(parsed_command: dict):
+    """Execute a write operation (for testing purposes)"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not parsed_command:
+        raise HTTPException(status_code=400, detail="Parsed command cannot be empty")
+    
+    result = await sales_rag_service.execute_write_operation(parsed_command)
+    
+    return result
+
 # Root endpoint
 @app.get("/")
 async def root():
@@ -208,7 +150,8 @@ async def root():
             "health": "/health",
             "slack_events": "/slack/events",
             "sync_salesforce": "/sync/salesforce",
-            "search": "/search"
+            "search": "/search",
+            "write": "/write"
         }
     }
 

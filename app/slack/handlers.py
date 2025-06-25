@@ -14,6 +14,9 @@ from ..config import config
 
 logger = logging.getLogger(__name__)
 
+# In-memory store for pending write operations (in production, use Redis or database)
+pending_write_operations = {}
+
 class SlackHandler:
     def __init__(self, embedding_service: EmbeddingService, generation_service: GenerationService,
                  salesforce_client: SalesforceClient, db_session_maker):
@@ -85,8 +88,11 @@ class SlackHandler:
         def handle_message(message, say):
             """Handle direct messages and mentions for continued conversation"""
             try:
+                logger.debug(f"Received message: {message}")
+                
                 # Only respond if bot is mentioned or in DM
                 if not self._should_respond_to_message(message):
+                    logger.debug("Not responding to this message based on _should_respond_to_message")
                     return
                 
                 text = message.get('text', '').strip()
@@ -95,8 +101,11 @@ class SlackHandler:
                 thread_ts = message.get('thread_ts')
                 message_ts = message.get('ts')
                 
+                logger.info(f"Processing message: text='{text}', channel={channel_id}, user={user_id}, thread={thread_ts}")
+                
                 # Skip if this is a bot message
                 if message.get('bot_id'):
+                    logger.debug("Skipping bot message")
                     return
                 
                 # Get user info
@@ -149,18 +158,26 @@ class SlackHandler:
         """Determine if bot should respond to this message"""
         text = message.get('text', '').lower()
         channel_type = message.get('channel_type')
+        thread_ts = message.get('thread_ts')
+        
+        logger.debug(f"Checking if should respond to message: text='{text}', channel_type='{channel_type}', thread_ts='{thread_ts}'")
         
         # Respond to DMs
         if channel_type == 'im':
+            logger.debug("Responding because it's a DM")
             return True
         
         # Respond if bot is mentioned
-        bot_user_id = self.app.client.auth_test()['user_id']
-        if f'<@{bot_user_id}>' in text:
-            return True
+        try:
+            bot_user_id = self.app.client.auth_test()['user_id']
+            if f'<@{bot_user_id}>' in text:
+                logger.debug("Responding because bot is mentioned")
+                return True
+        except Exception as e:
+            logger.error(f"Error getting bot user ID: {e}")
+            return False
         
         # Respond in threads where bot has participated
-        thread_ts = message.get('thread_ts')
         if thread_ts:
             # Check if bot has messages in this thread
             try:
@@ -168,18 +185,39 @@ class SlackHandler:
                     channel=message.get('channel'),
                     ts=thread_ts
                 )
+                logger.debug(f"Checking thread {thread_ts} with {len(thread_messages.get('messages', []))} messages")
+                
                 for msg in thread_messages['messages']:
-                    if msg.get('bot_id') == bot_user_id:
+                    msg_user = msg.get('user')
+                    msg_bot_id = msg.get('bot_id')
+                    logger.debug(f"Thread message: user={msg_user}, bot_id={msg_bot_id}, bot_user_id={bot_user_id}")
+                    
+                    # Check if message is from our bot (either by user ID or bot ID)
+                    if msg_user == bot_user_id or msg_bot_id:
+                        logger.debug("Found bot message in thread - will respond")
                         return True
-            except Exception:
-                pass
+                        
+            except Exception as e:
+                logger.error(f"Error checking thread messages: {e}")
         
+        logger.debug("Not responding to this message")
         return False
     
     def _process_sales_question(self, question: str, channel_id: str, user_id: str, 
                                user_name: str, thread_ts: Optional[str] = None) -> Dict[str, Any]:
-        """Process a sales question using RAG"""
+        """Process a sales question using RAG or handle write operations"""
         try:
+            # Check if this is a confirmation response
+            question_lower = question.lower().strip()
+            logger.debug(f"Processing question: '{question_lower}' for user {user_id} in channel {channel_id}, thread {thread_ts}")
+            
+            if question_lower in ['yes', 'y', 'confirm', 'ok', 'proceed']:
+                logger.info(f"Detected confirmation 'yes' from user {user_id}")
+                return self._handle_write_confirmation(channel_id, user_id, thread_ts, True)
+            elif question_lower in ['no', 'n', 'cancel', 'abort', 'stop']:
+                logger.info(f"Detected confirmation 'no' from user {user_id}")
+                return self._handle_write_confirmation(channel_id, user_id, thread_ts, False)
+            
             # Get thread context if in a thread
             thread_context = []
             if thread_ts:
@@ -200,13 +238,17 @@ class SlackHandler:
                 thread_filter=thread_ts
             )
             
-            # Generate response
-            response_data = self.generation_service.generate_rag_response(
+            # Process query (read or write operation)
+            response_data = self.generation_service.process_query(
                 question=question,
                 context_documents=context_documents,
                 thread_context=thread_context,
                 conversation_history=conversation_history
             )
+            
+            # If this is a write operation requiring confirmation, store it
+            if response_data.get('requires_confirmation'):
+                self._store_pending_write_operation(channel_id, user_id, thread_ts, response_data.get('parsed_command'))
             
             return response_data
             
@@ -219,15 +261,78 @@ class SlackHandler:
                 "thread_context_used": 0
             }
     
+    def _store_pending_write_operation(self, channel_id: str, user_id: str, 
+                                      thread_ts: Optional[str], parsed_command: Dict[str, Any]):
+        """Store a pending write operation for confirmation"""
+        key = f"{channel_id}:{user_id}:{thread_ts or 'direct'}"
+        pending_write_operations[key] = {
+            'parsed_command': parsed_command,
+            'timestamp': datetime.utcnow(),
+            'channel_id': channel_id,
+            'user_id': user_id,
+            'thread_ts': thread_ts
+        }
+        logger.info(f"Stored pending write operation for {key}")
+
+    def _handle_write_confirmation(self, channel_id: str, user_id: str, 
+                                  thread_ts: Optional[str], confirmed: bool) -> Dict[str, Any]:
+        """Handle write operation confirmation"""
+        key = f"{channel_id}:{user_id}:{thread_ts or 'direct'}"
+        logger.info(f"Handling write confirmation for key: {key}, confirmed: {confirmed}")
+        logger.debug(f"Current pending operations: {list(pending_write_operations.keys())}")
+        
+        if key not in pending_write_operations:
+            logger.warning(f"No pending operation found for key: {key}")
+            return {
+                "answer": "I don't have any pending operations to confirm. Please start with a new command.",
+                "sources": [],
+                "context_used": 0
+            }
+        
+        pending_op = pending_write_operations.pop(key)
+        logger.info(f"Found and removed pending operation for key: {key}")
+        
+        if not confirmed:
+            logger.info("Write operation cancelled by user")
+            return {
+                "answer": "❌ Write operation cancelled. No changes were made to Salesforce.",
+                "sources": [],
+                "context_used": 0
+            }
+        
+        # Execute the write operation
+        try:
+            result = self.generation_service.execute_confirmed_write_operation(
+                pending_op['parsed_command']
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Error executing confirmed write operation: {e}")
+            return {
+                "answer": f"❌ Error executing write operation: {str(e)}",
+                "sources": [],
+                "context_used": 0
+            }
+
     def _format_response(self, response_data: Dict[str, Any]) -> str:
         """Format the response for Slack"""
         answer = response_data.get('answer', '')
         sources = response_data.get('sources', [])
+        is_write = response_data.get('is_write', False)
         
         formatted_response = answer
         
-        # Add source information if available
-        if sources:
+        # Add emoji indicators for write operations
+        if is_write:
+            if response_data.get('write_success'):
+                formatted_response = "✅ " + formatted_response
+            elif response_data.get('requires_confirmation'):
+                formatted_response = "⚠️ " + formatted_response
+            elif not response_data.get('write_success', True):  # Failed write operation
+                formatted_response = "❌ " + formatted_response
+        
+        # Add source information if available (for read operations)
+        if sources and not is_write:
             formatted_response += "\n\n*Sources:*"
             for source in sources[:3]:  # Limit to 3 sources to avoid clutter
                 if source['type'] == 'salesforce':

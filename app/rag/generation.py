@@ -6,9 +6,94 @@ import json
 logger = logging.getLogger(__name__)
 
 class GenerationService:
-    def __init__(self, openai_api_key: str):
+    def __init__(self, openai_api_key: str, sf_client=None):
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
+        self.sf_client = sf_client
+        self.write_parser = None
     
+    def _get_write_parser(self):
+        """Lazy initialization of write parser to avoid circular imports"""
+        if self.write_parser is None and self.sf_client is not None:
+            from app.rag.write_operations import WriteOperationParser
+            self.write_parser = WriteOperationParser(self.sf_client)
+        return self.write_parser
+    
+    def process_query(self, 
+                     question: str, 
+                     context_documents: List[Dict[str, Any]],
+                     thread_context: Optional[List[Dict[str, Any]]] = None,
+                     conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+        """Process a query - either read (RAG) or write operation"""
+        
+        # Check if this is a write operation
+        write_parser = self._get_write_parser()
+        if write_parser:
+            parsed_command = write_parser.parse_write_command(question)
+            
+            if parsed_command.get('is_write'):
+                # Handle write operation
+                if parsed_command.get('operation') == 'unclear':
+                    return {
+                        "answer": f"I understand you want to modify Salesforce data, but I need more information. {parsed_command.get('suggestions', '')}",
+                        "is_write": True,
+                        "requires_confirmation": False,
+                        "sources": [],
+                        "context_used": 0
+                    }
+                elif parsed_command.get('operation') == 'error':
+                    return {
+                        "answer": parsed_command.get('message', 'Sorry, I had trouble understanding that command.'),
+                        "is_write": True,
+                        "requires_confirmation": False,
+                        "sources": [],
+                        "context_used": 0
+                    }
+                else:
+                    # Valid write operation - return confirmation request
+                    return {
+                        "answer": f"🤖 **Salesforce Write Operation Detected**\n\n{parsed_command.get('confirmation', 'I need to modify Salesforce data.')}\n\n**Please confirm:** Reply with 'yes' to proceed or 'no' to cancel.",
+                        "is_write": True,
+                        "requires_confirmation": True,
+                        "parsed_command": parsed_command,
+                        "sources": [],
+                        "context_used": 0
+                    }
+        
+        # Not a write operation - proceed with normal RAG response
+        return self.generate_rag_response(question, context_documents, thread_context, conversation_history)
+    
+    def execute_confirmed_write_operation(self, parsed_command: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a confirmed write operation"""
+        write_parser = self._get_write_parser()
+        if not write_parser:
+            return {
+                "answer": "❌ Write operations are not available - Salesforce client not configured.",
+                "is_write": True,
+                "sources": [],
+                "context_used": 0
+            }
+        
+        try:
+            result = write_parser.execute_write_operation(parsed_command)
+            
+            return {
+                "answer": result.get('message', 'Operation completed'),
+                "is_write": True,
+                "write_success": result.get('success', False),
+                "record_id": result.get('record_id'),
+                "sources": [],
+                "context_used": 0
+            }
+        except Exception as e:
+            logger.error(f"Error executing write operation: {e}")
+            return {
+                "answer": f"❌ Error executing write operation: {str(e)}",
+                "is_write": True,
+                "write_success": False,
+                "sources": [],
+                "context_used": 0
+            }
+
     def generate_rag_response(self, 
                             question: str, 
                             context_documents: List[Dict[str, Any]],

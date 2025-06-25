@@ -17,18 +17,25 @@ logger = logging.getLogger(__name__)
 class SalesRAGService:
     def __init__(self, db_session_maker):
         self.db_session_maker = db_session_maker
-        self.embedding_service = EmbeddingService(
-            openai_api_key=config.OPENAI_API_KEY,
-            chroma_path="./chroma_db"
-        )
-        self.generation_service = GenerationService(
-            openai_api_key=config.OPENAI_API_KEY
-        )
+        
+        # Initialize Salesforce client first
         self.salesforce_client = SalesforceClient(
             username=config.SALESFORCE_USERNAME,
             password=config.SALESFORCE_PASSWORD,
             security_token=config.SALESFORCE_SECURITY_TOKEN,
             domain=config.SALESFORCE_DOMAIN
+        )
+        
+        # Initialize embedding service
+        self.embedding_service = EmbeddingService(
+            openai_api_key=config.OPENAI_API_KEY,
+            chroma_path="./chroma_db"
+        )
+        
+        # Initialize generation service with salesforce client
+        self.generation_service = GenerationService(
+            openai_api_key=config.OPENAI_API_KEY,
+            sf_client=self.salesforce_client
         )
         
         # Initialize Slack handler
@@ -178,8 +185,10 @@ class SalesRAGService:
     
     async def search_sales_data(self, query: str, source_filter: Optional[str] = None,
                                channel_filter: Optional[str] = None,
-                               thread_filter: Optional[str] = None) -> dict:
-        """Search sales data using RAG"""
+                               thread_filter: Optional[str] = None,
+                               thread_context: Optional[list] = None,
+                               conversation_history: Optional[list] = None) -> dict:
+        """Search sales data using RAG or handle write operations"""
         try:
             # Search for relevant documents
             context_documents = self.embedding_service.search_similar_content(
@@ -190,21 +199,37 @@ class SalesRAGService:
                 thread_filter=thread_filter
             )
             
-            # Generate response
-            response_data = self.generation_service.generate_rag_response(
+            # Process query (read or write operation)
+            response_data = self.generation_service.process_query(
                 question=query,
-                context_documents=context_documents
+                context_documents=context_documents,
+                thread_context=thread_context,
+                conversation_history=conversation_history
             )
             
             return response_data
             
         except Exception as e:
-            logger.error(f"Error searching sales data: {e}")
+            logger.error(f"Error processing query: {e}")
             return {
-                "answer": "I apologize, but I encountered an error while searching. Please try again.",
+                "answer": "I apologize, but I encountered an error while processing your request. Please try again.",
                 "sources": [],
                 "context_used": 0,
                 "thread_context_used": 0
+            }
+    
+    async def execute_write_operation(self, parsed_command: dict) -> dict:
+        """Execute a confirmed write operation"""
+        try:
+            return self.generation_service.execute_confirmed_write_operation(parsed_command)
+        except Exception as e:
+            logger.error(f"Error executing write operation: {e}")
+            return {
+                "answer": f"❌ Error executing write operation: {str(e)}",
+                "is_write": True,
+                "write_success": False,
+                "sources": [],
+                "context_used": 0
             }
     
     def get_slack_handler(self):
