@@ -33,9 +33,9 @@ except ImportError:
                     params['created_after'] = kwargs['created_after']
                 if 'meeting_type' in kwargs:
                     params['meeting_type'] = kwargs['meeting_type']
-                # Add email filtering for attendees
-                if 'calendar_invitees' in kwargs:
-                    params['calendar_invitees'] = kwargs['calendar_invitees']
+                # Add email filtering for attendees with proper array parameter format
+                if 'calendar_invitees[]' in kwargs:
+                    params['calendar_invitees[]'] = kwargs['calendar_invitees[]']
                 
                 response = await client.get(
                     f"{self.base_url}/meetings",
@@ -76,6 +76,7 @@ class FathomClient:
     async def search_meetings_by_salesforce_contacts(self, salesforce_client, company_name: str = None, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Enhanced workflow: Get emails from Salesforce, then search Fathom by each email individually
+        Returns ALL meetings with company contacts, properly deduplicated
         """
         if not self.is_available():
             logger.warning("Fathom client not available")
@@ -89,17 +90,19 @@ class FathomClient:
                 logger.info(f"No Salesforce contacts found for company: {company_name}")
                 return []
             
-            logger.info(f"Found {len(contact_emails)} Salesforce contacts to search for meetings")
+            logger.info(f"Found {len(contact_emails)} Salesforce contacts for {company_name}: {contact_emails[:5]}...")
             
             # Step 2: Search Fathom for each email individually
             all_meetings = []
-            for email in contact_emails[:10]:  # Limit to 10 emails to avoid too many API calls
+            for email in contact_emails:  # Search ALL emails, not just first 10
                 try:
-                    email_meetings = await self.search_meetings_by_attendee_email(email, limit=10)
+                    # Get more meetings per email to ensure comprehensive coverage
+                    email_meetings = await self.search_meetings_by_attendee_email(email, limit=15)
                     if email_meetings:
                         logger.info(f"Found {len(email_meetings)} meetings for {email}")
                         for meeting in email_meetings:
                             meeting['_matched_email'] = email  # Track which email matched
+                            meeting['_company'] = company_name  # Track company
                         all_meetings.extend(email_meetings)
                     
                     # Small delay to be respectful to API
@@ -109,15 +112,24 @@ class FathomClient:
                     logger.error(f"Error searching meetings for email {email}: {e}")
                     continue
             
-            # Step 3: Deduplicate and sort by recency
+            # Step 3: Enhanced deduplication - same meeting can appear for multiple company contacts
             unique_meetings = self._deduplicate_meetings(all_meetings)
-            unique_meetings.sort(key=lambda x: x.get('created_at', ''), reverse=True)
             
-            logger.info(f"Found {len(unique_meetings)} unique meetings from Salesforce contacts")
-            return unique_meetings[:limit]
+            # Step 4: Sort by recency and apply final limit
+            unique_meetings.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+            final_meetings = unique_meetings[:limit]
+            
+            logger.info(f"Found {len(unique_meetings)} unique meetings from {company_name} contacts (returning {len(final_meetings)})")
+            
+            # Log details for debugging
+            if final_meetings:
+                meeting_titles = [m.get('title', 'Untitled')[:30] for m in final_meetings[:3]]
+                logger.info(f"Top {company_name} meetings: {meeting_titles}")
+            
+            return final_meetings
             
         except Exception as e:
-            logger.error(f"Error in Salesforce-based meeting search: {e}")
+            logger.error(f"Error in Salesforce-based meeting search for {company_name}: {e}")
             return []
     
     async def search_meetings_by_attendee_email(self, email: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -137,7 +149,7 @@ class FathomClient:
                 params = {
                     'include_transcript': True,  # Always include transcripts
                     'limit': batch_size,
-                    'calendar_invitees': [email]  # Filter by specific email
+                    'calendar_invitees[]': email  # FIXED: Use array parameter format!
                 }
                 if cursor:
                     params['cursor'] = cursor

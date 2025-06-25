@@ -669,112 +669,155 @@ class SalesRAGService:
         }
         
         try:
-            # Enhanced search with company filtering
-            context_documents = self.embedding_service.search_similar_content(
-                query=query,
-                n_results=8,  # Reduced to make room for Fathom results
-                source_filter=source_filter,
-                channel_filter=channel_filter,
-                thread_filter=thread_filter,
-                company_filter=company_filter
-            )
+            # Check if this is a company-specific query
+            company_name = company_filter or self._extract_company_from_query(query)
+            is_company_specific = bool(company_name)
             
-            # If asking about a specific company, also get company-specific results
-            if company_filter or self._contains_company_mention(query):
-                company_name = company_filter or self._extract_company_from_query(query)
-                if company_name:
-                    company_results = self.embedding_service.search_by_company(company_name, n_results=3)
-                    # Merge results, prioritizing company-specific ones
-                    context_documents = company_results + context_documents
-                    context_documents = context_documents[:8]  # Keep top 8
-            
-            # Add Fathom meeting search results - ALWAYS search Fathom for every query
-            fathom_meetings = []
-            logger.info(f"🔍 Fathom client available: {self.fathom_client.is_available()}")
-            logger.info(f"🔑 Fathom API key configured: {'Yes' if self.fathom_client.api_key else 'No'}")
-            
-            if self.fathom_client.is_available():
-                # Always search Fathom to ensure comprehensive results
-                should_search_meetings = True  # ALWAYS include Fathom search
-                meeting_keywords_detected = self._should_include_meeting_data(query)
-                logger.info(f"🎯 Meeting keywords detected: {meeting_keywords_detected}")
-                logger.info(f"🎯 ALWAYS including Fathom meeting data for comprehensive search")
+            if is_company_specific:
+                logger.info(f"🎯 COMPANY-SPECIFIC QUERY detected for: {company_name}")
+                logger.info(f"🎯 Will return ONLY {company_name} data (no other companies)")
                 
-                if should_search_meetings:
-                    logger.info(f"🎯 Including Fathom meeting data for query: {query}")
+                # For company-specific queries, get ONLY that company's data
+                context_documents = self.embedding_service.search_by_company(
+                    company_name, 
+                    n_results=6  # Leave room for Fathom meetings
+                )
+                
+                # Add Fathom meetings - Company-specific search ONLY
+                fathom_meetings = []
+                if self.fathom_client.is_available():
+                    logger.info(f"📞 Searching Fathom for {company_name} meetings ONLY")
                     
                     try:
-                        # Add timeout to prevent hanging
                         import asyncio
                         
-                        # Enhanced search strategy: Use Salesforce-integrated approach when possible
-                        company_name = company_filter or self._extract_company_from_query(query)
+                        # Use Salesforce-integrated search to get ALL meetings with company contacts
+                        fathom_meetings = await asyncio.wait_for(
+                            self.fathom_client.search_meetings_by_salesforce_contacts(
+                                salesforce_client=self.salesforce_client,
+                                company_name=company_name,
+                                limit=25  # Increased to get ALL company meetings
+                            ),
+                            timeout=25.0
+                        )
                         
-                        if company_name:
-                            logger.info(f"📞 Using Salesforce-integrated search for company: {company_name}")
-                            # Use the new Salesforce-integrated search method
+                        # If no Salesforce-integrated results, try legacy company search
+                        if not fathom_meetings:
+                            logger.info(f"📞 Fallback: Legacy company search for {company_name}")
                             fathom_meetings = await asyncio.wait_for(
-                                self.fathom_client.search_meetings_by_salesforce_contacts(
-                                    salesforce_client=self.salesforce_client,
-                                    company_name=company_name,
-                                    limit=5
-                                ),
-                                timeout=20.0  # Longer timeout for Salesforce integration
-                            )
-                            
-                            # Fallback to legacy company search if no results
-                            if not fathom_meetings:
-                                logger.info(f"📞 Fallback: Using legacy company search for: {company_name}")
-                                fathom_meetings = await asyncio.wait_for(
-                                    self.fathom_client.search_meetings_by_company(company_name, limit=3),
-                                    timeout=15.0
-                                )
-                        else:
-                            # For general queries, use standard meeting search
-                            logger.info(f"📞 Searching Fathom meetings for general query: '{query}'")
-                            fathom_meetings = await asyncio.wait_for(
-                                self.fathom_client.search_meetings_by_query(query, limit=5),
+                                self.fathom_client.search_meetings_by_company(company_name, limit=10),
                                 timeout=15.0
                             )
                         
-                        logger.info(f"🔍 Fathom API returned {len(fathom_meetings)} meetings")
+                        logger.info(f"🔍 Found {len(fathom_meetings)} {company_name} meetings")
                         
                         if fathom_meetings:
-                            logger.info(f"✅ Found {len(fathom_meetings)} relevant Fathom meetings")
-                            # Format meetings as context documents
+                            # Format ALL company meetings for context
                             fathom_context = []
                             for i, meeting in enumerate(fathom_meetings):
-                                logger.debug(f"Formatting meeting {i+1}: {meeting.get('title', 'Untitled')}")
+                                logger.debug(f"Adding {company_name} meeting {i+1}: {meeting.get('title', 'Untitled')}")
                                 formatted_meeting = self.fathom_client.format_meeting_for_context(meeting)
                                 matched_email = meeting.get('_matched_email', '')
                                 fathom_context.append({
                                     'content': formatted_meeting,
-                                    'source': 'fathom',  # Move source to root level
+                                    'source': 'fathom',
                                     'metadata': {
                                         'type': 'meeting',
                                         'title': meeting.get('title', 'Meeting'),
                                         'date': meeting.get('created_at', ''),
                                         'meeting_url': meeting.get('share_url', meeting.get('url', '')),
-                                        'matched_email': matched_email  # Track which Salesforce contact matched
+                                        'matched_email': matched_email,
+                                        'company': company_name  # Track company
                                     }
                                 })
                             
-                            # Add Fathom meetings to context (prioritize them at the beginning)
+                            # Prioritize Fathom meetings for company queries
                             context_documents = fathom_context + context_documents
-                            context_documents = context_documents[:12]  # Increase limit to accommodate meetings
-                            logger.info(f"📋 Total context documents: {len(context_documents)} (including {len(fathom_context)} meetings)")
+                            # Allow more total context for company-specific queries
+                            context_documents = context_documents[:20]
+                            logger.info(f"📋 Company-specific context: {len(context_documents)} documents ({len(fathom_context)} meetings)")
                         else:
-                            logger.info("ℹ️ No relevant Fathom meetings found")
+                            logger.info(f"ℹ️ No {company_name} meetings found in Fathom")
                     
                     except asyncio.TimeoutError:
-                        logger.warning("⏰ Fathom search timed out")
+                        logger.warning(f"⏰ {company_name} Fathom search timed out")
                         fathom_meetings = []
                     except Exception as e:
-                        logger.error(f"❌ Error searching Fathom meetings: {e}")
+                        logger.error(f"❌ Error searching {company_name} meetings: {e}")
                         fathom_meetings = []
-                # Note: We now ALWAYS search Fathom - no conditional exclusion
+                
+                debug_info.update({
+                    "company_specific_query": True,
+                    "target_company": company_name,
+                    "company_meetings_found": len(fathom_meetings)
+                })
+                
             else:
-                logger.warning("⚠️ Fathom client not available")
+                logger.info(f"🌐 GENERAL QUERY - searching all data sources")
+                
+                # For general queries, use the existing comprehensive search
+                context_documents = self.embedding_service.search_similar_content(
+                    query=query,
+                    n_results=8,  # Reduced to make room for Fathom results
+                    source_filter=source_filter,
+                    channel_filter=channel_filter,
+                    thread_filter=thread_filter,
+                    company_filter=company_filter
+                )
+                
+                # Add Fathom meeting search results - General search
+                fathom_meetings = []
+                logger.info(f"🔍 Fathom client available: {self.fathom_client.is_available()}")
+                
+                if self.fathom_client.is_available():
+                    logger.info(f"📞 Searching Fathom meetings for general query: '{query}'")
+                    
+                    try:
+                        import asyncio
+                        
+                        # For general queries, use query-based search
+                        fathom_meetings = await asyncio.wait_for(
+                            self.fathom_client.search_meetings_by_query(query, limit=5),
+                            timeout=15.0
+                        )
+                        
+                        logger.info(f"🔍 General query found {len(fathom_meetings)} meetings")
+                        
+                        if fathom_meetings:
+                            # Format meetings as context documents
+                            fathom_context = []
+                            for i, meeting in enumerate(fathom_meetings):
+                                logger.debug(f"Adding general meeting {i+1}: {meeting.get('title', 'Untitled')}")
+                                formatted_meeting = self.fathom_client.format_meeting_for_context(meeting)
+                                fathom_context.append({
+                                    'content': formatted_meeting,
+                                    'source': 'fathom',
+                                    'metadata': {
+                                        'type': 'meeting',
+                                        'title': meeting.get('title', 'Meeting'),
+                                        'date': meeting.get('created_at', ''),
+                                        'meeting_url': meeting.get('share_url', meeting.get('url', ''))
+                                    }
+                                })
+                            
+                            # Add Fathom meetings to context
+                            context_documents = fathom_context + context_documents
+                            context_documents = context_documents[:12]  # Limit for general queries
+                            logger.info(f"📋 General context: {len(context_documents)} documents ({len(fathom_context)} meetings)")
+                        else:
+                            logger.info("ℹ️ No relevant meetings found for general query")
+                    
+                    except asyncio.TimeoutError:
+                        logger.warning("⏰ General Fathom search timed out")
+                        fathom_meetings = []
+                    except Exception as e:
+                        logger.error(f"❌ Error searching general meetings: {e}")
+                        fathom_meetings = []
+                
+                debug_info.update({
+                    "company_specific_query": False,
+                    "general_meetings_found": len(fathom_meetings)
+                })
             
             # Process query (read or write operation)
             response_data = self.generation_service.process_query(
@@ -787,8 +830,6 @@ class SalesRAGService:
             # Add debug information
             debug_info.update({
                 "fathom_meetings_found": len(fathom_meetings),
-                "fathom_always_searched": True,  # Now always searching Fathom
-                "meeting_keywords_detected": self._should_include_meeting_data(query),
                 "total_context_docs": len(context_documents),
                 "success": True
             })

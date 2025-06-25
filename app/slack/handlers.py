@@ -172,43 +172,29 @@ class SlackHandler:
             except Exception as e:
                 logger.error(f"Error in message event handler: {e}")
         
-        # Button interaction handlers
-        @self.app.action("search_records")
-        def handle_search_records(ack, body, respond):
-            ack()
-            self._handle_search_mode(body, respond)
-        
-        @self.app.action("update_record")
-        def handle_update_record(ack, body, respond):
-            ack()
-            self._handle_update_mode(body, respond)
-        
-        @self.app.action("create_new")
-        def handle_create_new(ack, body, respond):
-            ack()
-            self._handle_create_mode(body, respond)
-        
+        # Button interaction handlers (removed search_records, update_record, create_new)
         @self.app.action("end_session")
         def handle_end_session(ack, body, respond):
             ack()
-            session_key = body['actions'][0]['value']
-            
-            # Clear active session
-            if session_key in active_sessions:
-                del active_sessions[session_key]
-            
-            # Clear conversation history from database
             try:
-                channel_id, user_id = session_key.split(':')
-                self._clear_conversation_history(channel_id, user_id)
-                logger.info(f"Cleared conversation history for user {user_id} in channel {channel_id}")
+                # Get session key from button value
+                session_key = body['actions'][0]['value']
+                
+                # Clear the session
+                if session_key in active_sessions:
+                    del active_sessions[session_key]
+                
+                respond({
+                    "response_type": "ephemeral",
+                    "text": "✅ Session ended. Use `/sales` to start a new session.",
+                    "replace_original": True
+                })
             except Exception as e:
-                logger.error(f"Error clearing conversation history: {e}")
-            
-            respond({
-                "response_type": "ephemeral",
-                "text": "✅ Session ended and conversation history cleared. Use `/sales` to start a fresh session."
-            })
+                logger.error(f"Error ending session: {e}")
+                respond({
+                    "response_type": "ephemeral",
+                    "text": "❌ Error ending session"
+                })
         
         @self.app.action("clear_history")
         def handle_clear_history(ack, body, respond):
@@ -525,6 +511,9 @@ class SlackHandler:
                 conversation_history=conversation_history
             )
             
+            # Add the original question to response_data for formatting
+            response_data['question'] = question
+            
             # If this is a write operation requiring confirmation, store it
             if response_data.get('requires_confirmation'):
                 self._store_pending_write_operation(channel_id, user_id, thread_ts, response_data.get('parsed_command'))
@@ -537,7 +526,8 @@ class SlackHandler:
                 "answer": "I apologize, but I encountered an error while processing your question. Please try again.",
                 "sources": [],
                 "context_used": 0,
-                "thread_context_used": 0
+                "thread_context_used": 0,
+                "question": question
             }
     
     def _store_pending_write_operation(self, channel_id: str, user_id: str, 
@@ -565,7 +555,8 @@ class SlackHandler:
             return {
                 "answer": "I don't have any pending operations to confirm. Please start with a new command.",
                 "sources": [],
-                "context_used": 0
+                "context_used": 0,
+                "question": "Confirmation response"
             }
         
         pending_op = pending_write_operations.pop(key)
@@ -576,7 +567,8 @@ class SlackHandler:
             return {
                 "answer": "❌ Write operation cancelled. No changes were made to Salesforce.",
                 "sources": [],
-                "context_used": 0
+                "context_used": 0,
+                "question": "Write operation cancellation"
             }
         
         # Execute the write operation
@@ -584,40 +576,88 @@ class SlackHandler:
             result = self.generation_service.execute_confirmed_write_operation(
                 pending_op['parsed_command']
             )
+            # Add question for formatting
+            result['question'] = "Write operation confirmation"
             return result
         except Exception as e:
             logger.error(f"Error executing confirmed write operation: {e}")
             return {
                 "answer": f"❌ Error executing write operation: {str(e)}",
                 "sources": [],
-                "context_used": 0
+                "context_used": 0,
+                "question": "Write operation execution"
             }
 
     def _format_response(self, response_data: Dict[str, Any]) -> str:
-        """Format the response for Slack"""
+        """Format the response for Slack with user's prompt at the top"""
         answer = response_data.get('answer', '')
         sources = response_data.get('sources', [])
         is_write = response_data.get('is_write', False)
+        question = response_data.get('question', '')  # Get the original question
         
-        formatted_response = answer
+        # Start with the prompt if available
+        formatted_response = ""
+        if question:
+            formatted_response = f"**Prompt:** {question}\n\n"
         
-        # Add emoji indicators for write operations
+        # Add the answer
         if is_write:
             if response_data.get('write_success'):
-                formatted_response = "✅ " + formatted_response
+                formatted_response += f"**Answer:** ✅ {answer}"
             elif response_data.get('requires_confirmation'):
-                formatted_response = "⚠️ " + formatted_response
+                formatted_response += f"**Answer:** ⚠️ {answer}"
             elif not response_data.get('write_success', True):  # Failed write operation
-                formatted_response = "❌ " + formatted_response
+                formatted_response += f"**Answer:** ❌ {answer}"
+        else:
+            formatted_response += f"**Answer:** {answer}"
         
         # Add source information if available (for read operations)
         if sources and not is_write:
-            formatted_response += "\n\n*Sources:*"
-            for source in sources[:3]:  # Limit to 3 sources to avoid clutter
-                if source['type'] == 'salesforce':
-                    formatted_response += f"\n• Salesforce {source['object_type']}: {source.get('title', 'Record')}"
-                elif source['type'] == 'slack':
-                    formatted_response += f"\n• Slack #{source['channel']} by {source['user']}"
+            # Group sources by type
+            salesforce_sources = []
+            fathom_sources = []
+            slack_sources = []
+            
+            for source in sources:
+                if source.get('type') == 'salesforce':
+                    salesforce_sources.append(source)
+                elif source.get('type') == 'fathom':
+                    fathom_sources.append(source)
+                elif source.get('type') == 'slack':
+                    slack_sources.append(source)
+            
+            formatted_response += "\n\n**Sources:**"
+            
+            # Salesforce sources
+            if salesforce_sources:
+                formatted_response += "\nSalesforce: "
+                sf_items = []
+                for source in salesforce_sources[:3]:  # Limit to 3 sources
+                    sf_items.append(source.get('title', 'Record'))
+                formatted_response += ", ".join(sf_items)
+            
+            # Fathom sources  
+            if fathom_sources:
+                formatted_response += "\nFathom: "
+                fathom_items = []
+                for source in fathom_sources[:3]:  # Limit to 3 sources
+                    # Format as "Meeting with Person"
+                    meeting_title = source.get('title', 'Meeting')
+                    if 'attendees' in source and source['attendees']:
+                        attendees = source['attendees'][:2]  # First 2 attendees
+                        fathom_items.append(f"{meeting_title} with {', '.join(attendees)}")
+                    else:
+                        fathom_items.append(meeting_title)
+                formatted_response += ", ".join(fathom_items)
+            
+            # Slack sources
+            if slack_sources:
+                formatted_response += "\nSlack: "
+                slack_items = []
+                for source in slack_sources[:3]:  # Limit to 3 sources
+                    channel = source.get('channel', 'unknown')
+                    slack_items.append(f"#{channel}")
+                formatted_response += ", ".join(slack_items)
         
         return formatted_response
     
@@ -890,37 +930,7 @@ class SlackHandler:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "🤖 *Sales Assistant* (Only visible to you)\n\nWhat would you like to do?"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "🔍 Search Records"},
-                        "action_id": "search_records",
-                        "value": session_key
-                    },
-                    {
-                        "type": "button", 
-                        "text": {"type": "plain_text", "text": "📝 Update Record"},
-                        "action_id": "update_record",
-                        "value": session_key
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "➕ Create New"},
-                        "action_id": "create_new",
-                        "value": session_key
-                    }
-                ]
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn", 
-                    "text": "Or type your question in the channel - I'll respond privately to you."
+                    "text": "🤖 *Sales Assistant* (Only visible to you)"
                 }
             },
             {
@@ -1053,114 +1063,6 @@ class SlackHandler:
                         "text": {"type": "plain_text", "text": "🧹 Clear History"},
                         "action_id": "clear_history",
                         "value": session_key
-                    }
-                ]
-            }
-        ]
-        
-        respond({
-            "response_type": "ephemeral",
-            "blocks": blocks
-        })
-    
-    def _handle_search_mode(self, body, respond):
-        """Handle search records button click"""
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "🔍 *Search Mode* (Only visible to you)\n\nWhat would you like to search for?\n\n*Examples:*\n• All opportunities closing this month\n• Contacts at Zillow\n• Deals worth more than $50k\n• Recent activity on Account XYZ"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "_Type your search question in the channel or click Chat below._"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "💬 Chat"},
-                        "action_id": "open_chat",
-                        "value": body['actions'][0]['value'],
-                        "style": "primary"
-                    }
-                ]
-            }
-        ]
-        
-        respond({
-            "response_type": "ephemeral",
-            "blocks": blocks
-        })
-    
-    def _handle_update_mode(self, body, respond):
-        """Handle update record button click"""
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "📝 *Update Mode* (Only visible to you)\n\nWhat would you like to update?\n\n*Examples:*\n• Update Zillow opportunity stage to Closed Won\n• Add next steps to the ABC Corp deal\n• Change close date for opportunity XYZ to next Friday\n• Update contact John Smith's phone number"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "_Type your update request in the channel or click Chat below._"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "💬 Chat"},
-                        "action_id": "open_chat",
-                        "value": body['actions'][0]['value'],
-                        "style": "primary"
-                    }
-                ]
-            }
-        ]
-        
-        respond({
-            "response_type": "ephemeral",
-            "blocks": blocks
-        })
-    
-    def _handle_create_mode(self, body, respond):
-        """Handle create new button click"""
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "➕ *Create Mode* (Only visible to you)\n\nWhat would you like to create?\n\n*Examples:*\n• Create a new account for Company ABC\n• Add contact Jane Doe at example.com\n• Create follow-up task for tomorrow\n• New opportunity for $25k closing next quarter"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "_Type your creation request in the channel or click Chat below._"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "💬 Chat"},
-                        "action_id": "open_chat",
-                        "value": body['actions'][0]['value'],
-                        "style": "primary"
                     }
                 ]
             }
@@ -1440,37 +1342,7 @@ class SlackHandler:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "🤖 *Sales Assistant* (Only visible to you)\n\nWhat would you like to do?"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "🔍 Search Records"},
-                        "action_id": "search_records",
-                        "value": session_key
-                    },
-                    {
-                        "type": "button", 
-                        "text": {"type": "plain_text", "text": "📝 Update Record"},
-                        "action_id": "update_record",
-                        "value": session_key
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "➕ Create New"},
-                        "action_id": "create_new",
-                        "value": session_key
-                    }
-                ]
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn", 
-                    "text": "Or type your question in the channel - I'll respond privately to you."
+                    "text": "🤖 *Sales Assistant* (Only visible to you)"
                 }
             },
             {
