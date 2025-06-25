@@ -41,10 +41,13 @@ async def comprehensive_slack_sync():
         cursor = None
         
         while True:
-            time.sleep(2)  # Rate limiting
+            # Proper rate limiting for channel discovery
+            print("   ⏳ Waiting 61 seconds (Slack rate limiting)...")
+            time.sleep(61)  # Respect Slack's 1 request per minute limit
+            
             params = {
                 'types': 'public_channel',  # Only public channels - we don't have groups:read scope
-                'limit': 200,  # Maximum allowed
+                'limit': 15,  # Use Slack's documented limit for non-marketplace apps
                 'exclude_archived': False  # Include archived channels too
             }
             if cursor:
@@ -53,11 +56,17 @@ async def comprehensive_slack_sync():
             channels_response = slack_client.conversations_list(**params)
             
             if not channels_response.get('ok'):
-                logger.error(f"Failed to get channels: {channels_response.get('error')}")
+                error = channels_response.get('error')
+                if error == 'ratelimited':
+                    print("   ⏳ Rate limited on channel discovery, waiting 122s...")
+                    time.sleep(122)  # Double wait if rate limited
+                    continue
+                logger.error(f"Failed to get channels: {error}")
                 break
             
             batch_channels = channels_response.get('channels', [])
             all_channels.extend(batch_channels)
+            print(f"   📄 Retrieved {len(batch_channels)} channels (total: {len(all_channels)})")
             
             cursor = channels_response.get('response_metadata', {}).get('next_cursor')
             if not cursor:
@@ -65,49 +74,62 @@ async def comprehensive_slack_sync():
         
         print(f"📊 Found {len(all_channels)} total channels")
         
-        # Find and prioritize the #fern-zillow channel
-        zillow_channel = None
+        # Find and prioritize channels based on focused criteria
+        print("\n2️⃣ Filtering channels based on focused criteria...")
+        
         priority_channels = []
-        other_channels = []
         
         for channel in all_channels:
             channel_name = channel.get('name', '').lower()
-            if 'zillow' in channel_name:
+            num_members = channel.get('num_members', 0)
+            
+            # Must have 5+ members
+            if num_members < 5:
+                continue
+            
+            # Check if it meets our focused criteria
+            is_relevant = False
+            reason = ""
+            
+            # Check if it's a fern- channel
+            if channel_name.startswith('fern-'):
+                is_relevant = True
+                reason = f"fern- channel with {num_members} members"
+            
+            # Check if it's specifically sales or meeting-reports
+            elif channel_name in ['sales', 'meeting-reports']:
+                is_relevant = True
+                reason = f"priority channel ({channel_name}) with {num_members} members"
+            
+            if is_relevant:
+                priority_channels.append(channel)
+                print(f"   ✅ #{channel['name']}: {reason}")
+        
+        # Process only the filtered channels
+        channels_to_process = priority_channels
+        
+        print(f"\n🎯 Processing {len(channels_to_process)} focused business channels")
+        
+        # Find Zillow channel if it exists in our filtered list
+        zillow_channel = None
+        for channel in channels_to_process:
+            if 'zillow' in channel['name'].lower():
+                zillow_channel = channel
                 print(f"🎯 FOUND ZILLOW CHANNEL: #{channel['name']}")
-                if zillow_channel is None:
-                    zillow_channel = channel
-                priority_channels.append(channel)
-            elif any(keyword in channel_name for keyword in ['sales', 'customer', 'deal', 'prospect']):
-                priority_channels.append(channel)
-            else:
-                other_channels.append(channel)
-        
-        # Process channels in priority order
-        channels_to_process = priority_channels + other_channels[:20]  # Limit to reasonable number
-        
-        print(f"\n2️⃣ Processing {len(channels_to_process)} channels (prioritizing Zillow and sales channels)")
-        
-        if zillow_channel:
-            print(f"🎯 PRIORITIZING: #{zillow_channel['name']} (ID: {zillow_channel['id']})")
+                break
         
         total_indexed = 0
         
         for i, channel in enumerate(channels_to_process):
             channel_id = channel['id']
             channel_name = channel['name']
-            is_archived = channel.get('is_archived', False)
             is_member = channel.get('is_member', False)
             
             print(f"\n--- Channel {i+1}/{len(channels_to_process)}: #{channel_name} ---")
-            print(f"   Archived: {is_archived}, Member: {is_member}")
-            
-            # Skip archived channels unless it's the Zillow channel
-            if is_archived and 'zillow' not in channel_name.lower():
-                print("   ⏭️ Skipping archived channel")
-                continue
+            print(f"   Members: {channel.get('num_members', 0)}, Bot is member: {is_member}")
             
             # Try to join channel if not a member
-            if not is_member and not is_archived:
+            if not is_member:
                 try:
                     join_response = slack_client.conversations_join(channel=channel_id)
                     if join_response.get('ok'):
@@ -132,10 +154,10 @@ async def comprehensive_slack_sync():
             total_indexed += indexed_count
             print(f"   📝 Indexed {indexed_count} messages")
             
-            # Shorter delay between channels for faster processing
+            # Reasonable delay between channels (no additional API calls needed)
             if i < len(channels_to_process) - 1:
-                print("   ⏳ Waiting 10 seconds...")
-                time.sleep(10)
+                print("   ⏳ Waiting 30 seconds between channels...")
+                time.sleep(30)
         
         print(f"\n🎉 COMPREHENSIVE SYNC COMPLETED!")
         print(f"📊 Total indexed: {total_indexed} messages across {len(channels_to_process)} channels")
@@ -164,24 +186,26 @@ async def comprehensive_slack_sync():
         return False
 
 async def comprehensive_channel_sync(embedding_service, slack_client, channel_id, channel_name, is_zillow_channel=False):
-    """Aggressively sync a single channel with much higher limits"""
+    """Sync a single channel with proper Slack API rate limiting"""
     try:
         from datetime import datetime, timedelta
         
-        # More aggressive settings for comprehensive sync
+        # Adjusted settings to respect Slack API limits while still being comprehensive
         if is_zillow_channel:
-            # Extra aggressive for Zillow channel
-            max_pages = 20  # Up to 20 pages (1000 messages)
-            messages_per_page = 200  # Maximum allowed by Slack
+            # More pages for Zillow channel but respect API limits
+            max_pages = 10  # More pages, but smaller batches
             days_back = 365  # Full year of history
             min_message_length = 1  # Index almost everything
-            print(f"   🎯 ZILLOW CHANNEL: Using maximum aggressive settings")
+            print(f"   🎯 ZILLOW CHANNEL: Using comprehensive settings with proper rate limiting")
         else:
-            # Still aggressive for other channels
-            max_pages = 10  # Up to 10 pages (500 messages)
-            messages_per_page = 100
-            days_back = 180  # 6 months
+            # Standard comprehensive settings for all focused channels
+            max_pages = 5
+            days_back = 365  # Full year of history for all channels
             min_message_length = 3
+        
+        # UPDATED: Respect Slack's documented rate limits for non-marketplace apps
+        base_wait = 61  # 61 seconds between requests (1 per minute + buffer)
+        messages_per_page = 15  # Slack's limit for non-marketplace apps
         
         # Calculate oldest timestamp
         oldest = datetime.now() - timedelta(days=days_back)
@@ -194,13 +218,14 @@ async def comprehensive_channel_sync(embedding_service, slack_client, channel_id
         while page_count < max_pages:
             page_count += 1
             
-            # Rate limiting - but faster than before
-            time.sleep(1)
+            # Proper rate limiting to respect Slack's API limits
+            print(f"   ⏳ Waiting {base_wait} seconds (Slack rate limiting)...")
+            time.sleep(base_wait)
             
             try:
                 params = {
                     'channel': channel_id,
-                    'limit': messages_per_page,
+                    'limit': messages_per_page,  # Use Slack's documented limit
                     'oldest': str(oldest_ts)
                 }
                 if cursor:
@@ -211,8 +236,10 @@ async def comprehensive_channel_sync(embedding_service, slack_client, channel_id
                 if not history_response.get('ok'):
                     error = history_response.get('error')
                     if error == 'ratelimited':
-                        print(f"   ⏳ Rate limited, waiting 30s...")
-                        time.sleep(30)
+                        # Additional wait if still rate limited
+                        wait_time = base_wait * 2
+                        print(f"   ⏳ Still rate limited, waiting {wait_time}s...")
+                        time.sleep(wait_time)
                         continue
                     else:
                         print(f"   ❌ Error: {error}")
@@ -277,7 +304,7 @@ async def comprehensive_channel_sync(embedding_service, slack_client, channel_id
                     indexed_count += 1
                 
                 # Progress indicator for large channels
-                if (i + 1) % 50 == 0:
+                if (i + 1) % 25 == 0:
                     print(f"   📝 Processed {i + 1}/{len(all_messages)} messages...")
                 
             except Exception as e:

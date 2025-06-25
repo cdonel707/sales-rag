@@ -450,81 +450,79 @@ class EmbeddingService:
             return []
     
     def find_relevant_channels(self, slack_client, company_names: List[str]) -> List[Dict[str, Any]]:
-        """Find Slack channels that might contain relevant discussions about companies"""
+        """Find channels relevant to companies with focused filtering criteria"""
         try:
+            logger.info("🔍 Finding relevant business channels...")
+            
+            # Get all channels with member info
+            all_channels = []
+            cursor = None
+            
+            while True:
+                # Respect Slack's rate limits
+                time.sleep(61)
+                
+                params = {
+                    'types': 'public_channel',
+                    'limit': 15,  # Slack's limit for non-marketplace apps
+                    'exclude_archived': True  # Only active channels
+                }
+                if cursor:
+                    params['cursor'] = cursor
+                
+                response = slack_client.conversations_list(**params)
+                if not response.get('ok'):
+                    logger.error(f"Failed to get channels: {response.get('error')}")
+                    break
+                
+                channels = response.get('channels', [])
+                all_channels.extend(channels)
+                
+                cursor = response.get('response_metadata', {}).get('next_cursor')
+                if not cursor:
+                    break
+            
+            logger.info(f"📊 Found {len(all_channels)} total public channels")
+            
+            # Filter channels based on focused criteria
             relevant_channels = []
             
-            logger.info("⚠️  Using extreme rate limiting due to Slack's new rate limits for non-Marketplace apps")
-            logger.info("   Reference: https://api.slack.com/apis/rate-limits")
-            
-            # Get all public channels with extremely conservative rate limiting
-            max_retries = 3
-            base_wait = 3  # Start with 3 seconds baseline wait
-            
-            # Always wait before API call
-            logger.info(f"Waiting {base_wait} seconds before listing channels...")
-            time.sleep(base_wait)
-            
-            logger.info("Listing all public channels...")
-            
-            for attempt in range(max_retries + 1):
-                try:
-                    channels_response = slack_client.conversations_list(
-                        types="public_channel",
-                        limit=100  # Further reduced from 200 to 100
-                    )
-                    
-                    if channels_response.get('ok'):
-                        break  # Success, exit retry loop
-                    elif channels_response.get('error') == 'ratelimited':
-                        if attempt < max_retries:
-                            # Much longer exponential backoff: 60s, 120s, 240s
-                            wait_time = 60 * (2 ** attempt)
-                            logger.warning(f"Rate limited while listing channels, waiting {wait_time}s (attempt {attempt + 1}/{max_retries + 1})")
-                            logger.warning("This is expected due to strict rate limits for non-Marketplace apps")
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            logger.error(f"Failed to list channels after {max_retries + 1} attempts")
-                            return []
-                    else:
-                        logger.error(f"Failed to list channels: {channels_response.get('error')}")
-                        return []
-                        
-                except Exception as e:
-                    if attempt < max_retries:
-                        wait_time = 60 * (2 ** attempt)
-                        logger.warning(f"Error listing channels, retrying in {wait_time}s: {e}")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(f"Error listing channels after retries: {e}")
-                        return []
-            
-            channels = channels_response.get('channels', [])
-            logger.info(f"Found {len(channels)} public channels to scan")
-            
-            for channel in channels:
+            for channel in all_channels:
                 channel_name = channel.get('name', '').lower()
+                num_members = channel.get('num_members', 0)
                 
-                # Check if channel name contains company names
-                for company in company_names:
-                    company_clean = re.sub(r'[^a-zA-Z0-9]', '', company.lower())
-                    if len(company_clean) > 3 and company_clean in channel_name:
-                        relevant_channels.append({
-                            'id': channel['id'],
-                            'name': channel['name'],
-                            'company_match': company,
-                            'match_type': 'channel_name'
-                        })
-                        break
+                # Check if channel meets our criteria
+                is_relevant = False
+                reason = ""
+                
+                # Must have 5+ members
+                if num_members < 5:
+                    continue
+                
+                # Check if it's a fern- channel
+                if channel_name.startswith('fern-'):
+                    is_relevant = True
+                    reason = f"fern- channel with {num_members} members"
+                
+                # Check if it's specifically sales or meeting-reports
+                elif channel_name in ['sales', 'meeting-reports']:
+                    is_relevant = True
+                    reason = f"priority channel ({channel_name}) with {num_members} members"
+                
+                # Skip if not relevant
+                if not is_relevant:
+                    continue
+                
+                relevant_channels.append({
+                    'id': channel['id'],
+                    'name': channel['name'],
+                    'num_members': num_members,
+                    'reason': reason
+                })
+                
+                logger.info(f"   ✅ #{channel['name']}: {reason}")
             
-            logger.info(f"Found {len(relevant_channels)} channels matching company names")
-            if len(relevant_channels) > 0:
-                logger.info("Channels found:")
-                for channel in relevant_channels:
-                    logger.info(f"  - #{channel['name']} (matched: {channel['company_match']})")
-            
+            logger.info(f"🎯 Found {len(relevant_channels)} relevant business channels")
             return relevant_channels
             
         except Exception as e:
@@ -532,29 +530,30 @@ class EmbeddingService:
             return []
     
     def index_channel_history(self, slack_client, channel_id: str, channel_name: str, 
-                            limit: int = 1000, days_back: int = 90):
-        """Index message history from a specific channel with proper Retry-After handling"""
+                            limit: int = 1000, days_back: int = 365):
+        """Index message history from a specific channel with proper Slack API rate limiting"""
         try:
-            # Calculate oldest timestamp (90 days back)
+            # Calculate oldest timestamp (365 days back)
             oldest = datetime.now() - timedelta(days=days_back)
             oldest_ts = oldest.timestamp()
             
-            # Very conservative rate limiting with proper Retry-After handling
-            max_retries = 3  # Reduced retries
-            base_wait = 2  # Wait 2 seconds between each API call as baseline
+            # UPDATED: Respect Slack's documented rate limits for non-marketplace apps
+            # Slack allows 1 request per minute with limit of 15 messages for non-marketplace apps
+            max_retries = 3
+            base_wait = 61  # 61 seconds between requests (1 per minute + buffer)
             
-            # Always wait before making API calls (1 request per 2 seconds baseline)
-            logger.info(f"Waiting {base_wait} seconds before API call (rate limiting)...")
+            # Always wait before making API calls to respect rate limits
+            logger.info(f"⏳ Waiting {base_wait} seconds before API call (Slack rate limiting)...")
             time.sleep(base_wait)
             
             for attempt in range(max_retries + 1):
                 try:
                     logger.info(f"Attempting to get history for #{channel_name} (attempt {attempt + 1}/{max_retries + 1})")
                     
-                    # Get channel history with very small limit
+                    # Get channel history with Slack's documented limit for non-marketplace apps
                     history_response = slack_client.conversations_history(
                         channel=channel_id,
-                        limit=min(limit, 20),  # Further reduced to 20 messages max
+                        limit=15,  # Slack's limit for non-marketplace apps
                         oldest=str(oldest_ts)
                     )
                     
@@ -562,14 +561,14 @@ class EmbeddingService:
                         break  # Success, exit retry loop
                     elif history_response.get('error') == 'ratelimited':
                         if attempt < max_retries:
-                            # Use Retry-After header if available, otherwise use longer fallback
+                            # Use Retry-After header if available, otherwise use exponential backoff
                             retry_after = self._get_retry_after_from_response(history_response)
                             if retry_after:
                                 wait_time = int(retry_after) + 5  # Add 5 seconds buffer
                                 logger.warning(f"Rate limited for #{channel_name}. Slack says wait {retry_after}s, waiting {wait_time}s")
                             else:
-                                # Fallback to much longer waits: 60s, 120s, 240s
-                                wait_time = 60 * (2 ** attempt)
+                                # Exponential backoff on top of base rate limiting: 61s, 122s, 244s
+                                wait_time = base_wait * (2 ** attempt)
                                 logger.warning(f"Rate limited for #{channel_name}, no Retry-After header. Waiting {wait_time}s")
                             
                             time.sleep(wait_time)
@@ -583,7 +582,7 @@ class EmbeddingService:
                         
                 except Exception as e:
                     if attempt < max_retries:
-                        wait_time = 60 * (2 ** attempt)
+                        wait_time = base_wait * (2 ** attempt)
                         logger.warning(f"Error getting history for #{channel_name}, retrying in {wait_time}s: {e}")
                         time.sleep(wait_time)
                         continue
@@ -595,7 +594,7 @@ class EmbeddingService:
             logger.info(f"Retrieved {len(messages)} messages from #{channel_name}")
             indexed_count = 0
             
-            # Process messages with extreme rate limiting
+            # Process messages with minimal rate limiting (no additional API calls)
             for i, message in enumerate(messages):
                 try:
                     # Skip bot messages and system messages
@@ -636,10 +635,10 @@ class EmbeddingService:
                     if success:
                         indexed_count += 1
                     
-                    # Wait between each message processing to avoid overwhelming
-                    if (i + 1) % 3 == 0:  # Every 3 messages instead of 5
-                        logger.debug(f"Processed {i + 1} messages, pausing 2 seconds...")
-                        time.sleep(2)
+                    # Minimal processing delay (no additional API calls)
+                    if (i + 1) % 5 == 0:  # Every 5 messages
+                        logger.debug(f"Processed {i + 1} messages, pausing 1 second...")
+                        time.sleep(1)
                         
                 except Exception as e:
                     logger.debug(f"Error processing message in #{channel_name}: {e}")
@@ -691,19 +690,19 @@ class EmbeddingService:
             return []
     
     def index_all_channel_messages(self, slack_client, channel_id: str, channel_name: str, 
-                                  limit: int = 100, days_back: int = 30):
-        """Index ALL messages from a specific channel with conservative rate limiting"""
+                                  limit: int = 100, days_back: int = 365):
+        """Index ALL messages from a specific channel with proper Slack API rate limiting"""
         try:
             # Calculate oldest timestamp
             oldest = datetime.now() - timedelta(days=days_back)
             oldest_ts = oldest.timestamp()
             
-            # Conservative rate limiting
-            max_retries = 4  # Increased retries
-            base_wait = 2  # Wait 2 seconds before API calls
+            # UPDATED: Respect Slack's documented rate limits for non-marketplace apps
+            max_retries = 4
+            base_wait = 61  # 61 seconds between requests (1 per minute + buffer)
             
-            # Always wait before making API calls
-            logger.info(f"Waiting {base_wait} seconds before API call (rate limiting)...")
+            # Always wait before making API calls to respect rate limits
+            logger.info(f"⏳ Waiting {base_wait} seconds before API call (Slack rate limiting)...")
             time.sleep(base_wait)
             
             all_messages = []
@@ -719,10 +718,10 @@ class EmbeddingService:
                     try:
                         logger.info(f"Attempting to get ALL messages from #{channel_name} (page {page_count}, attempt {attempt + 1}/{max_retries + 1})")
                         
-                        # Get channel history with pagination
+                        # Get channel history with pagination and Slack's documented limits
                         params = {
                             'channel': channel_id,
-                            'limit': min(limit, 50),  # Conservative limit per page
+                            'limit': 15,  # Slack's limit for non-marketplace apps
                             'oldest': str(oldest_ts)
                         }
                         if cursor:
@@ -734,8 +733,8 @@ class EmbeddingService:
                             break  # Success, exit retry loop
                         elif history_response.get('error') == 'ratelimited':
                             if attempt < max_retries:
-                                # Exponential backoff: 60s, 120s, 240s, 480s
-                                wait_time = 60 * (2 ** attempt)
+                                # Exponential backoff on top of base rate limiting
+                                wait_time = base_wait * (2 ** attempt)
                                 logger.warning(f"Rate limited for #{channel_name}, waiting {wait_time}s")
                                 time.sleep(wait_time)
                                 continue
@@ -751,7 +750,7 @@ class EmbeddingService:
                             
                     except Exception as e:
                         if attempt < max_retries:
-                            wait_time = 60 * (2 ** attempt)
+                            wait_time = base_wait * (2 ** attempt)
                             logger.warning(f"Error getting history for #{channel_name}, retrying in {wait_time}s: {e}")
                             time.sleep(wait_time)
                             continue
@@ -777,8 +776,9 @@ class EmbeddingService:
                     logger.info(f"No more messages available for #{channel_name}")
                     break
                 
-                # Small delay between pages
-                time.sleep(5)
+                # Wait before next page to respect rate limits
+                logger.info(f"⏳ Waiting {base_wait} seconds before next page...")
+                time.sleep(base_wait)
             
             logger.info(f"Retrieved total of {len(all_messages)} messages from #{channel_name} across {page_count} pages")
             
@@ -826,8 +826,8 @@ class EmbeddingService:
                     if success:
                         indexed_count += 1
                     
-                    # Small delay every few messages
-                    if (i + 1) % 10 == 0:  # Every 10 messages instead of 5
+                    # Minimal processing delay (no additional API calls)
+                    if (i + 1) % 10 == 0:  # Every 10 messages
                         logger.debug(f"Processed {i + 1} messages, pausing 1 second...")
                         time.sleep(1)
                         
@@ -843,8 +843,8 @@ class EmbeddingService:
             return 0
     
     def index_channel_with_smart_context(self, slack_client, channel_id: str, channel_name: str, 
-                                        category: str = 'medium', limit: int = 100, days_back: int = 30):
-        """Enhanced channel indexing with thread-aware intelligence and smart tagging"""
+                                        category: str = 'medium', limit: int = 100, days_back: int = 365):
+        """Enhanced channel indexing with thread-aware intelligence and proper Slack API rate limiting"""
         try:
             logger.info(f"🧠 Starting smart context indexing for #{channel_name} ({category})")
             
@@ -852,9 +852,9 @@ class EmbeddingService:
             oldest = datetime.now() - timedelta(days=days_back)
             oldest_ts = oldest.timestamp()
             
-            # Advanced rate limiting with exponential backoff
+            # UPDATED: Respect Slack's documented rate limits for non-marketplace apps
             max_retries = 5
-            base_wait = 5  # Start with 5 seconds
+            base_wait = 61  # 61 seconds between requests (1 per minute + buffer)
             
             logger.info(f"⏳ Waiting {base_wait} seconds before API call...")
             time.sleep(base_wait)
@@ -869,7 +869,7 @@ class EmbeddingService:
                     try:
                         params = {
                             'channel': channel_id,
-                            'limit': min(limit, 100),  # Reasonable limit
+                            'limit': 15,  # Slack's limit for non-marketplace apps
                             'oldest': str(oldest_ts)
                         }
                         if cursor:
@@ -881,8 +881,8 @@ class EmbeddingService:
                             break
                         elif history_response.get('error') == 'ratelimited':
                             if attempt < max_retries:
-                                # Exponential backoff: 30s, 60s, 120s, 240s, 480s
-                                wait_time = 30 * (2 ** attempt)
+                                # Exponential backoff on top of base rate limiting
+                                wait_time = base_wait * (2 ** attempt)
                                 logger.warning(f"Rate limited, waiting {wait_time}s (attempt {attempt + 1})")
                                 time.sleep(wait_time)
                                 continue
@@ -897,7 +897,7 @@ class EmbeddingService:
                             return 0
                     except Exception as e:
                         if attempt < max_retries:
-                            wait_time = 30 * (2 ** attempt)
+                            wait_time = base_wait * (2 ** attempt)
                             logger.warning(f"Exception, retrying in {wait_time}s: {e}")
                             time.sleep(wait_time)
                             continue
@@ -916,7 +916,9 @@ class EmbeddingService:
                 if not cursor or not history_response.get('has_more', False):
                     break
                 
-                time.sleep(10)  # Delay between pages
+                # Wait before next page to respect rate limits
+                logger.info(f"⏳ Waiting {base_wait} seconds before next page...")
+                time.sleep(base_wait)
             
             logger.info(f"📝 Retrieved {len(all_messages)} messages from #{channel_name}")
             
@@ -1084,7 +1086,7 @@ class EmbeddingService:
     
     def _index_thread_replies(self, slack_client, channel_id: str, channel_name: str, 
                              main_messages: list, days_back: int):
-        """Index all thread replies for messages that have threads - THIS WAS THE MISSING PIECE!"""
+        """Index all thread replies for messages that have threads with proper Slack API rate limiting"""
         try:
             logger.info(f"🧵 Indexing thread replies for #{channel_name}...")
             
@@ -1110,16 +1112,20 @@ class EmbeddingService:
             oldest = datetime.now() - timedelta(days=days_back)
             oldest_ts = oldest.timestamp()
             
+            # UPDATED: Respect Slack's documented rate limits for non-marketplace apps
+            base_wait = 61  # 61 seconds between requests (1 per minute + buffer)
+            
             # Index each thread's replies
             for i, thread_ts in enumerate(thread_timestamps):
                 try:
                     if i > 0 and i % 5 == 0:  # Every 5 threads, log progress
                         logger.info(f"   📊 Processed {i}/{len(thread_timestamps)} threads...")
                     
-                    # Rate limiting before each thread API call
-                    time.sleep(3)  # Conservative 3-second delay between thread calls
+                    # Rate limiting before each thread API call (respect Slack limits)
+                    logger.info(f"   ⏳ Waiting {base_wait} seconds before thread API call...")
+                    time.sleep(base_wait)
                     
-                    # Get thread replies
+                    # Get thread replies with proper rate limiting
                     max_retries = 3
                     for attempt in range(max_retries + 1):
                         try:
@@ -1127,14 +1133,15 @@ class EmbeddingService:
                                 channel=channel_id,
                                 ts=thread_ts,
                                 oldest=str(oldest_ts),
-                                limit=100  # Get up to 100 replies per thread
+                                limit=15  # Slack's limit for non-marketplace apps
                             )
                             
                             if replies_response.get('ok'):
                                 break  # Success
                             elif replies_response.get('error') == 'ratelimited':
                                 if attempt < max_retries:
-                                    wait_time = 30 * (2 ** attempt)  # 30s, 60s, 120s
+                                    # Exponential backoff on top of base rate limiting
+                                    wait_time = base_wait * (2 ** attempt)
                                     logger.warning(f"   Rate limited on thread {thread_ts}, waiting {wait_time}s")
                                     time.sleep(wait_time)
                                     continue
@@ -1147,7 +1154,7 @@ class EmbeddingService:
                                 
                         except Exception as e:
                             if attempt < max_retries:
-                                wait_time = 30 * (2 ** attempt)
+                                wait_time = base_wait * (2 ** attempt)
                                 logger.warning(f"   Exception getting thread {thread_ts}, retrying in {wait_time}s: {e}")
                                 time.sleep(wait_time)
                                 continue
