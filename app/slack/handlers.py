@@ -611,53 +611,7 @@ class SlackHandler:
         else:
             formatted_response += f"**Answer:** {answer}"
         
-        # Add source information if available (for read operations)
-        if sources and not is_write:
-            # Group sources by type
-            salesforce_sources = []
-            fathom_sources = []
-            slack_sources = []
-            
-            for source in sources:
-                if source.get('type') == 'salesforce':
-                    salesforce_sources.append(source)
-                elif source.get('type') == 'fathom':
-                    fathom_sources.append(source)
-                elif source.get('type') == 'slack':
-                    slack_sources.append(source)
-            
-            formatted_response += "\n\n**Sources:**"
-            
-            # Salesforce sources
-            if salesforce_sources:
-                formatted_response += "\nSalesforce: "
-                sf_items = []
-                for source in salesforce_sources[:3]:  # Limit to 3 sources
-                    sf_items.append(source.get('title', 'Record'))
-                formatted_response += ", ".join(sf_items)
-            
-            # Fathom sources  
-            if fathom_sources:
-                formatted_response += "\nFathom: "
-                fathom_items = []
-                for source in fathom_sources[:3]:  # Limit to 3 sources
-                    # Format as "Meeting with Person"
-                    meeting_title = source.get('title', 'Meeting')
-                    if 'attendees' in source and source['attendees']:
-                        attendees = source['attendees'][:2]  # First 2 attendees
-                        fathom_items.append(f"{meeting_title} with {', '.join(attendees)}")
-                    else:
-                        fathom_items.append(meeting_title)
-                formatted_response += ", ".join(fathom_items)
-            
-            # Slack sources
-            if slack_sources:
-                formatted_response += "\nSlack: "
-                slack_items = []
-                for source in slack_sources[:3]:  # Limit to 3 sources
-                    channel = source.get('channel', 'unknown')
-                    slack_items.append(f"#{channel}")
-                formatted_response += ", ".join(slack_items)
+        # Sources section removed per user request
         
         return formatted_response
     
