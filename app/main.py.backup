@@ -1,0 +1,193 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+
+from .database.models import create_database, get_session_maker
+from .services import SalesRAGService
+from .config import config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO if not config.DEBUG else logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Global service instance
+sales_rag_service = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler"""
+    global sales_rag_service
+    
+    logger.info("Starting Sales RAG Application...")
+    
+    try:
+        # Initialize database
+        engine = create_database(config.DATABASE_URL)
+        session_maker = get_session_maker(engine)
+        
+        # Initialize service
+        sales_rag_service = SalesRAGService(session_maker)
+        
+        # Initialize and sync data
+        await sales_rag_service.initialize()
+        
+        logger.info("Application startup completed successfully")
+        
+        yield
+        
+    except Exception as e:
+        logger.error(f"Error during application startup: {e}")
+        raise
+    finally:
+        logger.info("Application shutdown completed")
+
+# Create FastAPI app
+app = FastAPI(
+    title="Sales RAG Slack Bot",
+    description="A Slack bot that provides RAG-based answers from Salesforce and Slack data",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    health_status = await sales_rag_service.health_check()
+    
+    if health_status["status"] != "healthy":
+        raise HTTPException(status_code=503, detail=health_status)
+    
+    return health_status
+
+# Add the Slack handler after the sales_rag_service is initialized
+slack_handler = None
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    """Handle Slack events"""
+    global slack_handler
+    
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    # Initialize handler if not already done
+    if not slack_handler:
+        slack_handler = sales_rag_service.get_slack_handler()
+    
+    # Handle URL verification challenge
+    try:
+        body = await request.json()
+        if body.get("type") == "url_verification":
+            return {"challenge": body.get("challenge")}
+    except:
+        pass
+    
+    # Handle Slack requests
+    try:
+        # Use the Slack app directly instead of the handler wrapper
+        slack_app = sales_rag_service.slack_handler.app
+        
+        # Process the request with the Slack app
+        slack_request = await request.body()
+        headers = dict(request.headers)
+        
+        # Create a simple response handler
+        response = slack_app.process_request(
+            body=slack_request.decode('utf-8'),
+            headers=headers
+        )
+        
+        if response.status == 200:
+            # Parse the response body if it's JSON
+            if response.body:
+                try:
+                    import json
+                    return json.loads(response.body)
+                except:
+                    return {"text": response.body}
+            return {"status": "ok"}
+        else:
+            logger.error(f"Slack app returned status {response.status}: {response.body}")
+            return {"text": "Sorry, I encountered an error. Please try again."}
+            
+    except Exception as e:
+        logger.error(f"Error handling Slack request: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {"text": "Sorry, I encountered an error processing your request. Please try again."}
+
+# Manual data sync endpoint
+@app.post("/sync/salesforce")
+async def sync_salesforce_data(background_tasks: BackgroundTasks, force: bool = False):
+    """Manually trigger Salesforce data sync"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    background_tasks.add_task(sales_rag_service.sync_salesforce_data, force)
+    
+    return {
+        "message": "Salesforce data sync started",
+        "force_resync": force
+    }
+
+# Search endpoint for testing
+@app.post("/search")
+async def search_sales_data(query: str, source_filter: str = None):
+    """Search sales data (for testing purposes)"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
+    result = await sales_rag_service.search_sales_data(
+        query=query,
+        source_filter=source_filter
+    )
+    
+    return result
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Sales RAG Slack Bot is running",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "slack_events": "/slack/events",
+            "sync_salesforce": "/sync/salesforce",
+            "search": "/search"
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    logger.info(f"Starting server on {config.HOST}:{config.PORT}")
+    uvicorn.run(
+        "app.main:app",
+        host=config.HOST,
+        port=config.PORT,
+        reload=config.DEBUG,
+        log_level="info" if not config.DEBUG else "debug"
+    ) 
