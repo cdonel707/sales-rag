@@ -193,6 +193,26 @@ async def debug_entities():
         "sample_opportunities": list(embedding_service.opportunity_cache)[:5]
     }
 
+# Emergency endpoint to clear active sessions
+@app.post("/emergency/clear-sessions")
+async def clear_active_sessions():
+    """Emergency endpoint to clear all active Slack sessions if bot is auto-responding"""
+    if not sales_rag_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    try:
+        # Clear active sessions
+        sales_rag_service.slack_handler.clear_all_active_sessions()
+        
+        return {
+            "message": "🧹 All active Slack sessions cleared",
+            "status": "success",
+            "note": "This should stop any unwanted auto-responding behavior"
+        }
+    except Exception as e:
+        logger.error(f"Error clearing active sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear sessions: {str(e)}")
+
 # Write operation endpoint for testing
 @app.post("/write")
 async def execute_write_operation(parsed_command: dict):

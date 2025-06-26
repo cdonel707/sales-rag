@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 pending_write_operations = {}
 active_sessions = {}  # Track ongoing conversations
 
+def clear_stale_sessions():
+    """Clear any stale active sessions to prevent auto-responding issues"""
+    global active_sessions
+    logger.info(f"Clearing {len(active_sessions)} active sessions to prevent auto-responding")
+    active_sessions.clear()
+    logger.info("✅ All active sessions cleared")
+
 class SlackHandler:
     def __init__(self, embedding_service: EmbeddingService, generation_service: GenerationService,
                  salesforce_client: SalesforceClient, db_session_maker, sales_rag_service=None):
@@ -29,6 +36,9 @@ class SlackHandler:
         
         # Real-time indexing control
         self.realtime_indexing_enabled = False
+        
+        # Clear any stale sessions on startup
+        self.clear_all_active_sessions()
         
         # Initialize Slack app
         self.app = App(
@@ -99,11 +109,11 @@ class SlackHandler:
                 session_key = f"{channel_id}:{user_id}"
                 has_active_session = session_key in active_sessions
                 
-                # Determine if we should respond and how
-                should_respond_normally = self._should_respond_to_message(message)
+                # Determine if we should respond - ONLY respond when explicitly mentioned or in DMs
+                should_respond = self._should_respond_to_message(message)
                 
-                if not should_respond_normally and not has_active_session:
-                    logger.debug("Not responding to this message - no mention, DM, or active session")
+                if not should_respond:
+                    logger.debug("Not responding to this message - bot not mentioned and not a DM")
                     return
                 
                 logger.info(f"Processing message: text='{text}', channel={channel_id}, user={user_id}, thread={thread_ts}, has_session={has_active_session}")
@@ -363,19 +373,19 @@ class SlackHandler:
                 logger.error(f"Error handling chat modal submission: {e}")
     
     def _should_respond_to_message(self, message: Dict[str, Any]) -> bool:
-        """Determine if bot should respond to this message"""
+        """Determine if bot should respond to this message - CONSERVATIVE approach"""
         text = message.get('text', '').lower()
         channel_type = message.get('channel_type')
         thread_ts = message.get('thread_ts')
         
         logger.debug(f"Checking if should respond to message: text='{text}', channel_type='{channel_type}', thread_ts='{thread_ts}'")
         
-        # Respond to DMs
+        # ONLY respond to DMs
         if channel_type == 'im':
             logger.debug("Responding because it's a DM")
             return True
         
-        # Respond if bot is mentioned
+        # ONLY respond if bot is directly mentioned
         try:
             bot_user_id = self.app.client.auth_test()['user_id']
             if f'<@{bot_user_id}>' in text:
@@ -385,30 +395,9 @@ class SlackHandler:
             logger.error(f"Error getting bot user ID: {e}")
             return False
         
-        # Respond in threads where bot has participated
-        if thread_ts:
-            # Check if bot has messages in this thread
-            try:
-                thread_messages = self.client.conversations_replies(
-                    channel=message.get('channel'),
-                    ts=thread_ts
-                )
-                logger.debug(f"Checking thread {thread_ts} with {len(thread_messages.get('messages', []))} messages")
-                
-                for msg in thread_messages['messages']:
-                    msg_user = msg.get('user')
-                    msg_bot_id = msg.get('bot_id')
-                    logger.debug(f"Thread message: user={msg_user}, bot_id={msg_bot_id}, bot_user_id={bot_user_id}")
-                    
-                    # Check if message is from our bot (either by user ID or bot ID)
-                    if msg_user == bot_user_id or msg_bot_id:
-                        logger.debug("Found bot message in thread - will respond")
-                        return True
-                        
-            except Exception as e:
-                logger.error(f"Error checking thread messages: {e}")
-        
-        logger.debug("Not responding to this message")
+        # DO NOT auto-respond in threads - require explicit mention
+        # This prevents the bot from auto-responding to every message in threads it has participated in
+        logger.debug("Not responding to this message - not a DM and bot not mentioned")
         return False
     
     def _process_sales_question(self, question: str, channel_id: str, user_id: str, 
@@ -1329,4 +1318,10 @@ class SlackHandler:
         respond({
             "response_type": "ephemeral",
             "blocks": blocks
-        }) 
+        })
+
+    def clear_all_active_sessions(self):
+        """Clear all active sessions"""
+        logger.info("Clearing all active sessions")
+        active_sessions.clear()
+        logger.info("✅ All active sessions cleared") 
