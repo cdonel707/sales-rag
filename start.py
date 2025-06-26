@@ -14,25 +14,18 @@ def main():
     print(f"📡 Server will run on {config.HOST}:{config.PORT}")
     print(f"🔧 Debug mode: {'ON' if config.DEBUG else 'OFF'}")
     
-    # Check if .env file exists
-    if not os.path.exists('.env'):
-        print("⚠️  Warning: .env file not found!")
-        print("Please create a .env file with your configuration.")
-        print("See .env.example for reference.")
-        return
-    
-    # Check for required environment variables
+    # Check for required environment variables directly (works for both Railway and local)
     required_vars = [
         'SLACK_BOT_TOKEN',
-        'SLACK_SIGNING_SECRET',
+        'SLACK_SIGNING_SECRET', 
         'SALESFORCE_USERNAME',
         'SALESFORCE_PASSWORD',
         'SALESFORCE_SECURITY_TOKEN',
         'OPENAI_API_KEY'
     ]
     
-    # Check for optional but recommended user token
-    user_token_available = getattr(config, 'SLACK_USER_TOKEN', None)
+    # Check for optional but recommended variables
+    optional_vars = ['SLACK_USER_TOKEN', 'FATHOM_API_KEY']
     
     missing_vars = []
     for var in required_vars:
@@ -43,21 +36,34 @@ def main():
         print("❌ Missing required environment variables:")
         for var in missing_vars:
             print(f"   - {var}")
-        print("\nPlease configure these in your .env file.")
+        
+        # Different messages for local vs Railway
+        if os.path.exists('.env'):
+            print("\nPlease add these variables to your .env file.")
+        else:
+            print("\nPlease configure these environment variables in Railway.")
         return
     
-    print("✅ Configuration looks good!")
+    print("✅ Required configuration found!")
+    
+    # Check optional services
+    available_optional = []
+    for var in optional_vars:
+        if getattr(config, var, None):
+            available_optional.append(var)
+    
+    if available_optional:
+        print(f"🔑 Optional services enabled: {', '.join(available_optional)}")
     
     # Show token configuration status
+    user_token_available = getattr(config, 'SLACK_USER_TOKEN', None)
+    fathom_available = getattr(config, 'FATHOM_API_KEY', None)
+    
     if user_token_available:
-        print("🔑 Dual-token setup detected:")
-        print("   - SLACK_BOT_TOKEN: For bot interactions")
-        print("   - SLACK_USER_TOKEN: For data syncing (no channel joining needed!)")
-    else:
-        print("⚠️  Single-token setup:")
-        print("   - SLACK_BOT_TOKEN: For both interactions and syncing")
-        print("   - Consider adding SLACK_USER_TOKEN for better data access")
-        print("   - See README for user token setup instructions")
+        print("🎯 Dual-token setup detected - optimal for data syncing!")
+    
+    if fathom_available:
+        print("📞 Fathom integration enabled - call transcripts available!")
     
     print("🔄 Starting application...")
     

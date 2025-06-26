@@ -1,7 +1,10 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# Only load .env file if it exists (for local development)
+# Railway automatically provides environment variables
+if os.path.exists('.env'):
+    load_dotenv()
 
 class Config:
     # Slack Configuration
