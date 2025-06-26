@@ -43,6 +43,8 @@ class WriteOperationParser:
                 recent_context += "\n"
             
             prompt = f"""
+            You are a Salesforce command parser. You MUST respond with ONLY valid JSON, nothing else.
+            
             Analyze this Salesforce command and extract structured information for write operations.
             
             Command: "{command}"
@@ -77,7 +79,9 @@ class WriteOperationParser:
             
             Common Opportunity Stages: Prospecting, Qualification, Needs Analysis, Value Proposition, Proposal/Price Quote, Negotiation/Review, Closed Won, Closed Lost
             
-            Respond with JSON:
+            RESPONSE FORMAT: Return ONLY valid JSON with no additional text, explanations, or formatting.
+            
+            For successful parsing:
             {{
                 "is_write": true,
                 "operation": "create_opportunity",
@@ -115,6 +119,8 @@ class WriteOperationParser:
                 "suggestions": "Could you specify...",
                 "confidence": 0.3
             }}
+            
+            Remember: Return ONLY the JSON object, no other text.
             """
             
             response = self.openai_client.chat.completions.create(
@@ -127,8 +133,45 @@ class WriteOperationParser:
                 max_tokens=1000
             )
             
-            result = json.loads(response.choices[0].message.content)
-            return result
+            response_content = response.choices[0].message.content.strip()
+            logger.info(f"OpenAI response for write parsing: {response_content}")
+            
+            if not response_content:
+                logger.error("Empty response from OpenAI")
+                return {
+                    'is_write': True,
+                    'operation': 'error',
+                    'error': 'Empty response from AI parser',
+                    'message': 'Sorry, I had trouble understanding that command. Could you try rephrasing it?'
+                }
+            
+            # Try to extract JSON if response has extra content
+            if not response_content.startswith('{'):
+                # Look for JSON block in response
+                import re
+                json_match = re.search(r'\{.*\}', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(0)
+                else:
+                    logger.error(f"No JSON found in response: {response_content}")
+                    return {
+                        'is_write': True,
+                        'operation': 'error',
+                        'error': 'Invalid response format',
+                        'message': 'Sorry, I had trouble understanding that command. Could you try rephrasing it?'
+                    }
+            
+            try:
+                result = json.loads(response_content)
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}, response: {response_content}")
+                return {
+                    'is_write': True,
+                    'operation': 'error',
+                    'error': f'JSON parsing failed: {str(e)}',
+                    'message': 'Sorry, I had trouble understanding that command. Could you try rephrasing it?'
+                }
             
         except Exception as e:
             logger.error(f"Error parsing write command: {e}")
@@ -189,9 +232,60 @@ class WriteOperationParser:
         
         return resolved
     
+    def _add_default_required_fields(self, data: Dict[str, Any], object_type: str) -> Dict[str, Any]:
+        """Add default values for org-specific required fields"""
+        
+        if object_type.lower() == 'account':
+            # Add common required fields that might exist in the org
+            if 'Source__c' not in data:
+                # Try to get valid picklist values for Source__c
+                source_values = self.sf_client.get_picklist_values('Account', 'Source__c')
+                if source_values:
+                    # Use the first available value, preferring common ones
+                    preferred_sources = ['Web', 'Other', 'Partner', 'Referral', 'Website', 'Online']
+                    selected_source = None
+                    
+                    for preferred in preferred_sources:
+                        if preferred in source_values:
+                            selected_source = preferred
+                            break
+                    
+                    if not selected_source:
+                        selected_source = source_values[0]  # Use first available
+                    
+                    data['Source__c'] = selected_source
+                    logger.info(f"Using Source__c value: {selected_source} (available: {source_values})")
+                else:
+                    # Fallback if we can't get picklist values
+                    data['Source__c'] = 'Other'
+                    
+            if 'Additional_Sourcing_Information__c' not in data:
+                data['Additional_Sourcing_Information__c'] = 'Created via Sales RAG Slack Bot'
+            if 'Type' not in data:
+                data['Type'] = 'Prospect'  # Default type
+                
+        elif object_type.lower() == 'opportunity':
+            # Add defaults for opportunity required fields
+            if 'StageName' not in data:
+                data['StageName'] = 'Prospecting'
+            if 'CloseDate' not in data:
+                from datetime import datetime, timedelta
+                data['CloseDate'] = (datetime.now() + timedelta(days=30)).date().isoformat()
+                
+        elif object_type.lower() == 'contact':
+            # Add defaults for contact required fields
+            if 'LastName' not in data and not data.get('LastName'):
+                if 'FirstName' in data:
+                    data['LastName'] = 'Unknown'  # Ensure LastName is present
+                    
+        return data
+    
     def _create_account(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new Account"""
         try:
+            # Add default required fields for this org
+            data = self._add_default_required_fields(data, 'Account')
+            
             result = self.sf_client.create_account(data)
             if result and result.get('success'):
                 return {
@@ -225,6 +319,9 @@ class WriteOperationParser:
             if 'CloseDate' in data:
                 data['CloseDate'] = self._parse_date(data['CloseDate'])
             
+            # Add default required fields for this org
+            data = self._add_default_required_fields(data, 'Opportunity')
+            
             result = self.sf_client.create_opportunity(data)
             if result and result.get('success'):
                 account_info = f" for {resolved.get('AccountName', 'Unknown Account')}" if resolved.get('AccountName') else ""
@@ -254,6 +351,9 @@ class WriteOperationParser:
             resolved = self._resolve_lookups(lookups)
             if 'AccountId' in resolved:
                 data['AccountId'] = resolved['AccountId']
+            
+            # Add default required fields for this org
+            data = self._add_default_required_fields(data, 'Contact')
             
             result = self.sf_client.create_contact(data)
             if result and result.get('success'):
