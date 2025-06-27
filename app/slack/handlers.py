@@ -692,44 +692,24 @@ class SlackHandler:
         return None
     
     def _enhance_search_query(self, question: str, company_filter: Optional[str] = None) -> str:
-        """Create enhanced search query that finds contextual discussions"""
+        """Create enhanced search query that preserves company detection"""
         question_lower = question.lower()
         
-        # If asking about company discussions, enhance the query 
+        # MINIMAL enhancement that preserves original semantic meaning
+        # Don't heavily modify the query as it breaks company detection
+        
         if company_filter:
-            company_lower = company_filter.lower()
-            
-            # Patterns for discussion queries
+            # For company-specific queries, keep the original question but add company context
             if any(pattern in question_lower for pattern in [
-                'discussions', 'talked about', 'conversations', 'messages', 'slack'
+                'conversations', 'discussed', 'talked about', 'meetings', 'calls'
             ]):
-                enhanced_query = f"conversations discussions messages communication with {company_filter} {company_lower} team members emails"
-                logger.debug(f"🔍 Enhanced search query: '{question}' → '{enhanced_query}'")
-                return enhanced_query
-            
-            # Patterns for meeting/collaboration queries
-            elif any(pattern in question_lower for pattern in [
-                'meetings', 'calls', 'demos', 'presentations'
-            ]):
-                enhanced_query = f"meetings calls demos presentations collaboration with {company_filter} {company_lower}"
-                logger.debug(f"🔍 Enhanced search query: '{question}' → '{enhanced_query}'")
-                return enhanced_query
-            
-            # Patterns for project/technical queries
-            elif any(pattern in question_lower for pattern in [
-                'project', 'integration', 'api', 'technical', 'implementation'
-            ]):
-                enhanced_query = f"project technical integration API implementation work with {company_filter} {company_lower}"
-                logger.debug(f"🔍 Enhanced search query: '{question}' → '{enhanced_query}'")
+                # Add minimal context without changing the core query
+                enhanced_query = f"{question} {company_filter}"
+                logger.debug(f"🔍 Minimally enhanced search query: '{question}' → '{enhanced_query}'")
                 return enhanced_query
         
-        # General enhancement - add context words
-        if any(pattern in question_lower for pattern in [
-            'what', 'tell me about', 'information', 'details'
-        ]):
-            return f"{question} context details information background"
-        
-        # Return original query if no enhancements needed
+        # For all other cases, return the original question to preserve semantic meaning
+        logger.debug(f"🔍 Using original query (no enhancement): '{question}'")
         return question
     
     def _index_slack_message(self, event: Dict[str, Any]):
