@@ -852,13 +852,14 @@ class SalesRAGService:
     def _contains_company_mention(self, query: str) -> bool:
         """Check if query mentions any known companies"""
         query_lower = query.lower()
-        return any(company in query_lower for company in self.embedding_service.company_cache if len(company) > 3)
+        return any(company.lower() in query_lower for company in self.embedding_service.company_cache if len(company) > 3)
     
     def _extract_company_from_query(self, query: str) -> Optional[str]:
         """Extract company name from query if mentioned"""
         query_lower = query.lower()
         for company in self.embedding_service.company_cache:
-            if len(company) > 3 and company in query_lower:
+            if len(company) > 3 and company.lower() in query_lower:  # Make case-insensitive
+                logger.info(f"🎯 Company detected: '{company}' (from query: '{query}')")
                 return company
         return None
     

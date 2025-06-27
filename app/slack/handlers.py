@@ -665,7 +665,8 @@ class SlackHandler:
         
         # METHOD 1: Direct company name mentions
         for company in self.embedding_service.company_cache:
-            if len(company) > 3 and company in question_lower:
+            if len(company) > 3 and company.lower() in question_lower:  # Make case-insensitive
+                logger.info(f"🎯 Slack handler: Company detected: '{company}' (from query: '{question}')")
                 return company
         
         # METHOD 2: Enhanced contextual patterns
