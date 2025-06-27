@@ -72,6 +72,15 @@ class WriteOperationParser:
             - Contact: FirstName, LastName, Email, Phone, Title, AccountId
             - Task: Subject, Description, Status, Priority, ActivityDate, WhoId, WhatId
             
+            OPPORTUNITY NAMING CONVENTIONS:
+            - When user says "create opportunity for [Company]", the Name should be "[Company]" NOT "Opportunity for [Company]"
+            - Examples:
+              * "Create opportunity for Candid Health" → Name: "Candid Health"
+              * "Create opportunity for Microsoft with docs" → Name: "Microsoft - Docs"
+              * "Create Zillow opportunity for SDK project" → Name: "Zillow - SDK"
+            - Use the company name as the base, add descriptive suffix if mentioned
+            - NEVER include words like "Opportunity for" or "Opportunity with" in the Name field
+            
             IMPORTANT FIELD MAPPING:
             - For "next steps" → use "next_steps" (system will find actual field)
             - For "notes" on Opportunity → use "notes" (system will find actual field)  
@@ -89,6 +98,16 @@ class WriteOperationParser:
                 "needs_lookup": [{{"object": "Account", "name": "..."}}, ...],
                 "confirmation": "I'll create a new opportunity called '...' for account '...' with amount $... and close date ...",
                 "confidence": 0.8
+            }}
+            
+            Example for "Create opportunity for Candid Health with $50K amount":
+            {{
+                "is_write": true,
+                "operation": "create_opportunity", 
+                "data": {{"Name": "Candid Health", "Amount": 50000}},
+                "needs_lookup": [{{"object": "Account", "name": "Candid Health"}}],
+                "confirmation": "I'll create a new opportunity called 'Candid Health' for account 'Candid Health' with amount $50,000.",
+                "confidence": 0.9
             }}
             
             For UPDATE operations (examples):
